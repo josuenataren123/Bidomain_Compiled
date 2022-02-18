@@ -1,0 +1,81 @@
+# OUTPUT FOLDER
+output_folder = output_ee_no_penalty_n_40
+# MESH
+mesh_filename = NONE
+# number of elements
+nelx = 40
+nely = 40
+nelz = 0
+# size
+maxx = 1.5
+maxy = 1.5
+maxz = 1.5
+minx = -1.5
+miny = -1.5
+minz = -1.5
+# element type
+eltype = QUAD4
+# tissue box subdomain
+tissue_maxx = 1.5
+tissue_maxy = 0.75
+tissue_maxz = 0.
+tissue_minx = -1.5
+tissue_miny = -0.75
+tissue_minz = 0.
+# stimulus box subdomain
+stimulus_maxx = -1.4
+stimulus_maxy = 0.75
+stimulus_maxz = 0.
+stimulus_minx = -1.5
+stimulus_miny = -0.75
+stimulus_minz = 0.
+stimulus_duration = 0.5
+stimulus_amplitude = -1.0
+stimulus_start_time = 0.0
+# ionic model
+# cubic: 
+k = 8.0
+v0 = 0
+v1 = 0.1
+v2 = 1.0
+
+
+# TIME DATA
+end_time = 30.
+dt = 0.001
+export_timesteps = 1000
+#Time Integrator
+integrator = EXPLICIT_EXTRACELLULAR
+# FEM
+p_order = 1
+# Dirichlet boundary conditions:
+bcs = '0 2'
+
+# FIBER FIELDS
+# f = longitudinal
+fx = 1.0
+fy = 0.0
+fz = 0.0
+# s = transversal
+sx = 0.0
+sy = 1.0
+sz = 0.0
+# n = normal
+nx = 0.0
+ny = 0.0
+nz = 1.0
+
+# penalty for imposing BC
+penalty = 1e8
+interface_penalty = 0.0
+
+# PARAMETERS
+sigma_f_i = 2.3172
+sigma_s_i = 0.2435
+sigma_n_i = 0.0569
+sigma_f_e = 1.5448
+sigma_s_e = 1.0438
+sigma_n_e = 0.37222
+sigma_b_ie= 6.0
+chi = 1e3
+Cm = 1.0
