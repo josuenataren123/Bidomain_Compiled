@@ -3,6 +3,8 @@ Bidomain Compiled Code
 
 To compile and use it you need an installation of libMesh.
 
+Clone the repository in a new folder.
+
 Denote with LIBMESH_PATH the path to the libMesh installation folder.
 Inside LIBMESH_PATH you should have a bin folder with the executable 'libmesh-config'
 
