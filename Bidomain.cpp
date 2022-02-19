@@ -33,6 +33,7 @@
 #include "libmesh/mesh_tools.h"
 #include "libmesh/parallel_mesh.h"
 #include "libmesh/elem.h"
+#include "libmesh/analytic_function.h"
 
 #include "libmesh/equation_systems.h"
 #include "libmesh/sparse_matrix.h"
@@ -51,6 +52,7 @@
 
 #include "libmesh/vtk_io.h"
 #include <iomanip>      // std::setw
+
 
 // Domain numbering
 enum class Subdomain : unsigned int
@@ -164,6 +166,13 @@ struct Pacing
 };
 
 
+double initial_condition_V(const libMesh::Point& p, const double time);
+double initial_condition_Ve(const libMesh::Point& p, const double time);
+double exact_solution_V(const libMesh::Point& p, const double time);
+double exact_solution_Ve(const libMesh::Point& p, const double time);
+double exact_solution_Ve_Vb(const libMesh::Point& p, const double time);
+void exact_solution_monolithic(libMesh::DenseVector<libMesh::Number>& output, const libMesh::Point& p, const double time);
+
 // Read mesh as specified in the input file
 void read_mesh(const GetPot &data, libMesh::ParallelMesh &mesh);
 // read BC sidesets from string: e.g. bc = "1 2 3 5", or bc = "1, 55, 2, 33"
@@ -183,6 +192,10 @@ void assemble_rhs(  libMesh::EquationSystems &es,
                     libMesh::Order p_order,
                     const GetPot &data,
                     EquationType type = EquationType::PARABOLIC );
+
+void assemble_forcing_and_eval_error(libMesh::EquationSystems &es, const TimeData &timedata, TimeIntegrator time_integrator, libMesh::Order p_order, const GetPot &data, IonicModel& ionic_model, std::vector<double>& error );
+
+
 
 
 int main(int argc, char **argv)
@@ -240,6 +253,8 @@ int main(int argc, char **argv)
     {
         using_implicit_time_integrator = true;
     }
+    bool convergence_test = data("convergence_test", false);
+
 
     // Create libMesh Equations systems
     // This will hold the mesh and create the corresponding
@@ -276,7 +291,18 @@ int main(int argc, char **argv)
             parabolic_system.add_matrix("M");
             parabolic_system.add_vector("ML");
             parabolic_system.add_vector("In");
+            parabolic_system.add_vector("FV"); // parabolic forcing term for exact solution
             parabolic_system.add_vector("aux1"); // auxilliary vector for assembling the RHS
+            elliptic_system.add_vector("FVe"); // elliptic forcing term for exact solution
+            es.init();
+            if(convergence_test)
+            {
+                libMesh::AnalyticFunction<libMesh::Number> ic_V(exact_solution_V);
+                libMesh::AnalyticFunction<libMesh::Number> ic_Ve_Vb(exact_solution_Ve_Vb);
+                parabolic_system.project_solution(&ic_V);
+                elliptic_system.project_solution(&ic_Ve_Vb);
+            }
+
             break;
         }
         case TimeIntegrator::SBDF1:
@@ -295,12 +321,20 @@ int main(int argc, char **argv)
             system.add_vector("Inm1");
             system.add_vector("Inm2");
             system.add_vector("Vnm2");
+            system.add_vector("F"); // forcing term for exact solution
             system.add_vector("aux1"); // auxilliary vector for assembling the RHS
+            es.init();
+
+            if(convergence_test)
+            {
+                libMesh::AnalyticFunction<libMesh::Number> ic(exact_solution_monolithic);
+                system.project_solution(&ic);
+            }
+
             break;
         }
     }
 
-    es.init();
     es.print_info();
 
     // setup pacing protocol
@@ -309,6 +343,7 @@ int main(int argc, char **argv)
     IonicModel ionic_model;
     ionic_model.setup(data);
     ionic_model.print();
+
 
 
     int save_iter = 0;
@@ -322,10 +357,14 @@ int main(int argc, char **argv)
         std::cout << "done " << std::endl;
     }
 
-
     // Start loop in time
+    std::vector<double> error(3);
     for (; datatime.time < datatime.end_time; )
     {
+        if(convergence_test)
+        {
+            assemble_forcing_and_eval_error(es, datatime, time_integrator, order, data, ionic_model, error);
+        }
         // advance time
         datatime.time += datatime.dt;
         datatime.timestep++;
@@ -466,6 +505,13 @@ int main(int argc, char **argv)
             libMesh::VTKIO(mesh).write_equation_systems(output_folder+"/bath_" + step_str + ".pvtu", es);
             std::cout << "done " << std::endl;
         }
+    }
+    if(convergence_test)
+    {
+        assemble_forcing_and_eval_error(es, datatime, time_integrator, order, data, ionic_model, error);
+        std::cout << "Error V: " << error[0] << std::endl;
+        std::cout << "Error Ve: " << error[1] << std::endl;
+        std::cout << "Error Vb: " << error[2] << std::endl;
     }
 
     return 0;
@@ -869,7 +915,6 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
                 coefficient *= 1.5;
             else if (time_integrator == TimeIntegrator::SBDF3)
                 coefficient *= 11 / 6.0;
-            std::cout << "SBDF coefficient: " << coefficient << std::endl;
 
             for (auto elem : mesh.element_ptr_range())
             {
@@ -984,6 +1029,321 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
     }
 }
 
+void assemble_forcing_and_eval_error(libMesh::EquationSystems &es, const TimeData &timedata, TimeIntegrator time_integrator, libMesh::Order p_order, const GetPot &data, IonicModel& ionic_model, std::vector<double>& error )
+{
+    using namespace libMesh;
+    // Create vector of BC sidesets ids
+    const MeshBase &mesh = es.get_mesh();
+    const unsigned int dim = mesh.mesh_dimension();
+
+    // volume element
+    FEType fe_type(p_order);
+    std::unique_ptr < FEBase > fe(FEBase::build(dim, fe_type));
+    Order qp_order = THIRD;
+    if (p_order > 1)
+        qp_order = FIFTH;
+    libMesh::QGauss qrule(dim, qp_order);
+    fe->attach_quadrature_rule(&qrule);
+
+    // quantities for volume integration
+    const std::vector<Real> &JxW = fe->get_JxW();
+    const std::vector<Point> &q_point = fe->get_xyz();
+    const std::vector<std::vector<Real>> &phi = fe->get_phi();
+
+    // define fiber field
+    double fx = data("fx", 1.0), fy = data("fy", 0.0), fz = data("fz", 0.0);
+    double sx = data("sx", 0.0), sy = data("sy", 1.0), sz = data("sz", 0.0);
+    double nx = data("nx", 0.0), ny = data("ny", 0.0), nz = data("nz", 1.0);
+    VectorValue<Number>  f0(fx, fy, fz);
+    VectorValue<Number>  s0(sx, sy, sz);
+    VectorValue<Number>  n0(nx, ny, nz);
+    // setup conductivities:
+    // Default parameters from
+    // Cardiac excitation mechanisms, wavefront dynamics and strength�interval
+    // curves predicted by 3D orthotropic bidomain simulations
+
+    // read parameters
+    double sigma_f_i = data("sigma_f_i", 2.3172);
+    double sigma_s_i = data("sigma_s_i", 0.2435); // sigma_t in the paper
+    double sigma_n_i = data("sigma_n_i", 0.0569);
+    double sigma_f_e = data("sigma_f_e", 1.5448);
+    double sigma_s_e = data("sigma_s_e", 1.0438);  // sigma_t in the paper
+    double sigma_n_e = data("sigma_n_e", 0.37222);
+    double sigma_b_ie = data("sigma_b", 6.0);
+    double chi = data("chi", 1e3);
+    double Cm = data("Cm", 1.5);
+    double penalty = data("penalty", 1e8);
+    double interface_penalty = data("interface_penalty", 1e4);
+
+    // setup tensors parameters
+    // f0 \otimes f0
+    TensorValue<Number> fof(fx * fx, fx * fy, fx * fz, fy * fx, fy * fy, fy * fz, fz * fx, fz * fy, fz * fz);
+    // s0 \otimes s0
+    TensorValue<Number> sos(sx * sx, sx * sy, sx * sz, sy * sx, sy * sy, sy * sz, sz * sx, sz * sy, sz * sz);
+    // n0 \otimes n0
+    TensorValue<Number> non(nx * nx, nx * ny, nx * nz, ny * nx, ny * ny, ny * nz, nz * nx, nz * ny, nz * nz);
+
+    TensorValue<Number> sigma_i = ( sigma_f_i * fof + sigma_s_i * sos + sigma_n_i * non ) /chi;
+    TensorValue<Number> sigma_e = ( sigma_f_e * fof + sigma_s_e * sos + sigma_n_e * non) / chi;
+    TensorValue<Number> sigma_b(sigma_b_ie/chi, 0.0, 0.0, 0.0, sigma_b_ie/chi, 0.0, 0.0, 0.0, sigma_b_ie/chi);
+
+    DenseVector < Number > Fp;
+    DenseVector < Number > Fe;
+
+    double error_vb = 0;
+    double error_ve = 0;
+    double error_v = 0;
+
+    std::vector < dof_id_type > dof_indices;
+    std::vector < dof_id_type > parabolic_dof_indices;
+    std::vector < dof_id_type > elliptic_dof_indices;
+
+    double h = 9.536743164062500e-07;
+    double dx = 9.536743164062500e-07;
+
+    double t = timedata.time+timedata.dt;
+    if( TimeIntegrator::EXPLICIT_INTRACELLULAR == time_integrator || TimeIntegrator::EXPLICIT_INTRACELLULAR == time_integrator)
+    {
+        t = timedata.time;
+    }
+    // Assemble matrices differently based on time integrator
+    switch (time_integrator)
+    {
+        case TimeIntegrator::EXPLICIT_EXTRACELLULAR:
+        case TimeIntegrator::EXPLICIT_INTRACELLULAR:
+        case TimeIntegrator::SEMI_IMPLICIT:
+        case TimeIntegrator::SEMI_IMPLICIT_HALF_STEP:
+        {
+            std::cout << "Assembling matrices for EXPLICIT EXTRACELLULAR: " << static_cast<int>(time_integrator) << std::endl;
+            libMesh::LinearImplicitSystem &elliptic_system = es.get_system < libMesh::LinearImplicitSystem > ("elliptic");
+            libMesh::TransientLinearImplicitSystem & parabolic_system = es.get_system < libMesh::TransientLinearImplicitSystem > ("parabolic");
+            parabolic_system.get_vector("FV").zero();
+            elliptic_system.get_vector("FVe").zero();
+
+            const DofMap & elliptic_dof_map = elliptic_system.get_dof_map();
+            const DofMap & parabolic_dof_map = parabolic_system.get_dof_map();
+
+
+            for (auto elem : mesh.element_ptr_range())
+            {
+                parabolic_dof_map.dof_indices(elem, parabolic_dof_indices);
+                elliptic_dof_map.dof_indices(elem, elliptic_dof_indices);
+                fe->reinit(elem);
+                int elliptic_ndofs = elliptic_dof_indices.size();
+                int parabolic_ndofs = parabolic_dof_indices.size();
+
+                // resize local elemental matrices
+                Fp.resize(parabolic_ndofs);
+                Fe.resize(elliptic_ndofs);
+
+                auto subdomain_id = elem->subdomain_id();
+
+                //std::cout << "Loop over volume: " << std::flush;
+
+                // if we are in the bath
+                if (subdomain_id == static_cast<short unsigned int>(Subdomain::BATH))
+                {
+                    for (unsigned int qp = 0; qp < qrule.n_points(); qp++)
+                    {
+                        // First Evaluate Error
+                        double Vb_h = elliptic_system.point_value(0, q_point[qp], elem);
+                        double Vb = exact_solution_Ve_Vb(q_point[qp], timedata.time);
+                        error_vb += JxW[qp] * (Vb_h - Vb);
+                        // Then evaluate forcing term
+                        // evaluate F = - div sigma_b grad Vb
+                        // West
+                        Vb = exact_solution_Ve_Vb(q_point[qp], t);
+                        double VbW = exact_solution_Ve_Vb(q_point[qp]+libMesh::Point(dx, 0, 0), t);
+                        // East
+                        double VbE = exact_solution_Ve_Vb(q_point[qp]+libMesh::Point(-dx, 0, 0), t);
+                        // North
+                        double VbN = exact_solution_Ve_Vb(q_point[qp]+libMesh::Point(0, dx, 0),  t);
+                        // South
+                        double VbS = exact_solution_Ve_Vb(q_point[qp]+libMesh::Point(0, -dx, 0), t);
+
+                        double Vb_xx = ( VbE - 2 * Vb + VbW ) / (dx * dx);
+                        double Vb_yy = ( VbN - 2 * Vb + VbS ) / (dx * dx);
+
+                        double F_bath = - sigma_b(0,0) * Vb_xx - sigma_b(1, 1) * Vb_yy;
+
+                        for (unsigned int i = 0; i != elliptic_ndofs; i++)
+                        {
+                            Fe(i) += JxW[qp] * F_bath * phi[i][qp];
+                        }
+                    }
+                }
+                else
+                {
+                    for (unsigned int qp = 0; qp < qrule.n_points(); qp++)
+                    {
+                        // First Evaluate Error
+                        double V_h = parabolic_system.point_value(0, q_point[qp], elem);
+                        double V = exact_solution_V(q_point[qp], timedata.time);
+                        error_v += JxW[qp] * (V_h - V);
+                        double Ve_h = elliptic_system.point_value(0, q_point[qp], elem);
+                        double Ve = exact_solution_Ve(q_point[qp], timedata.time);
+                        error_ve += JxW[qp] * (Ve_h - Ve);
+
+                        // Then evaluate forcing term
+                        // evaluate F = - div sigma_i grad V - div sigma_ie grad Ve
+                        // West
+                        V = exact_solution_V(q_point[qp], t);
+                        Ve = exact_solution_Ve(q_point[qp], t);
+                       double VW = exact_solution_V(q_point[qp]+libMesh::Point(dx, 0, 0), t);
+                        double VeW = exact_solution_Ve(q_point[qp]+libMesh::Point(dx, 0, 0), t);
+                        // East
+                        double VE = exact_solution_V(q_point[qp]+libMesh::Point(-dx, 0, 0), t);
+                        double VeE = exact_solution_Ve(q_point[qp]+libMesh::Point(-dx, 0, 0), t);
+
+                        double V_xx = ( VE - 2 * V + VW ) / (dx * dx);
+                        double Ve_xx = ( VeE - 2 * Ve + VeW ) / (dx * dx);
+
+                        double F_elliptic = - sigma_i(0,0) * V_xx - ( sigma_i(0, 0) + sigma_e(0, 0) ) * Ve_xx;
+                        for (unsigned int i = 0; i != elliptic_ndofs; i++)
+                        {
+                            Fe(i) += JxW[qp] * F_elliptic * phi[i][qp];
+                        }
+
+                        double tph = t+h;
+                        double tmh = t-h;
+                        double dVdt = 0.5 * ( exact_solution_V(q_point[qp], tph) - exact_solution_V(q_point[qp], tmh) ) / h;
+                        double I_ion = ionic_model.iion(V);
+                        double F_parabolic = Cm * dVdt + I_ion - sigma_i(0,0) * V_xx - sigma_i(0, 0) * Ve_xx;
+                        for (unsigned int i = 0; i != parabolic_ndofs; i++)
+                        {
+                            Fp(i) += JxW[qp] * F_parabolic * phi[i][qp];
+                        }
+
+                    }
+                }
+                parabolic_system.get_vector("FV").add_vector(Fp, parabolic_dof_indices);
+                elliptic_system.get_vector("FVe").add_vector(Fe, elliptic_dof_indices);
+            }
+            parabolic_system.get_vector("FV").close();
+            elliptic_system.get_vector("FVe").close();
+            break;
+        }
+        case TimeIntegrator::SBDF1:
+        case TimeIntegrator::SBDF2:
+        case TimeIntegrator::SBDF3:
+        default:
+        {
+            TransientLinearImplicitSystem &system = es.get_system < TransientLinearImplicitSystem > ("bidomain");
+            system.get_vector("F").zero();
+            const DofMap &dof_map = system.get_dof_map();
+            int V_var_number = system.variable_number("V");
+            int Ve_var_number = system.variable_number("Ve");
+
+            double coefficient = Cm / timedata.dt;
+            if (time_integrator == TimeIntegrator::SBDF2)
+                coefficient *= 1.5;
+            else if (time_integrator == TimeIntegrator::SBDF3)
+                coefficient *= 11 / 6.0;
+
+            for (auto elem : mesh.element_ptr_range())
+            {
+                dof_map.dof_indices(elem, dof_indices);
+                dof_map.dof_indices(elem, parabolic_dof_indices, V_var_number);
+                dof_map.dof_indices(elem, elliptic_dof_indices, Ve_var_number);
+
+                fe->reinit(elem);
+                int ndofs = dof_indices.size();
+                int elliptic_ndofs = elliptic_dof_indices.size();
+                int parabolic_ndofs = parabolic_dof_indices.size();
+
+                // resize local elemental matrices
+                Fp.resize(parabolic_ndofs);
+                Fe.resize(elliptic_ndofs);
+
+                auto subdomain_id = elem->subdomain_id();
+                // if we are in the bath
+                if (subdomain_id == static_cast<short unsigned int>(Subdomain::BATH))
+                {
+                    for (unsigned int qp = 0; qp < qrule.n_points(); qp++)
+                    {
+                        // First Evaluate Error
+                        double Vb_h = system.point_value(0, q_point[qp], elem);
+                        double Vb = exact_solution_Ve_Vb(q_point[qp], timedata.time);
+                        error_vb += JxW[qp] * (Vb_h - Vb);
+                        // Then evaluate forcing term
+                        // evaluate F = - div sigma_b grad Vb
+                        Vb = exact_solution_Ve_Vb(q_point[qp], t);
+                        // West
+                        double VbW = exact_solution_Ve_Vb(q_point[qp]+libMesh::Point(dx, 0, 0), t);
+                        // East
+                        double VbE = exact_solution_Ve_Vb(q_point[qp]+libMesh::Point(-dx, 0, 0), t);
+                        // North
+                        double VbN = exact_solution_Ve_Vb(q_point[qp]+libMesh::Point(0, dx, 0), t);
+                        // South
+                        double VbS = exact_solution_Ve_Vb(q_point[qp]+libMesh::Point(0, -dx, 0), t);
+
+                        double Vb_xx = ( VbE - 2 * Vb + VbW ) / (dx * dx);
+                        double Vb_yy = ( VbN - 2 * Vb + VbS ) / (dx * dx);
+
+                        double F_bath = - sigma_b(0,0) * Vb_xx - sigma_b(1, 1) * Vb_yy;
+
+                        for (unsigned int i = 0; i != elliptic_ndofs; i++)
+                        {
+                            Fe(i) += JxW[qp] * F_bath * phi[i][qp];
+                        }
+                    }
+                }
+                else
+                {
+                    for (unsigned int qp = 0; qp < qrule.n_points(); qp++)
+                    {
+                        // First Evaluate Error
+                        double V_h = system.point_value(V_var_number, q_point[qp], elem);
+                        double V = exact_solution_V(q_point[qp], timedata.time);
+                        error_v += JxW[qp] * (V_h - V);
+                        double Ve_h = system.point_value(Ve_var_number, q_point[qp], elem);
+                        double Ve = exact_solution_Ve(q_point[qp], timedata.time);
+                        error_ve += JxW[qp] * (Ve_h - Ve);
+
+                        // Then evaluate forcing term
+                        // evaluate F = - div sigma_i grad V - div sigma_ie grad Ve
+                        V = exact_solution_V(q_point[qp], t);
+                        Ve = exact_solution_Ve(q_point[qp], t);
+                        // West
+                        double VW = exact_solution_V(q_point[qp]+libMesh::Point(dx, 0, 0), t);
+                        double VeW = exact_solution_Ve(q_point[qp]+libMesh::Point(dx, 0, 0), t);
+                        // East
+                        double VE = exact_solution_V(q_point[qp]+libMesh::Point(-dx, 0, 0), t);
+                        double VeE = exact_solution_Ve(q_point[qp]+libMesh::Point(-dx, 0, 0), t);
+
+                        double V_xx = ( VE - 2 * V + VW ) / (dx * dx);
+                        double Ve_xx = ( VeE - 2 * Ve + VeW ) / (dx * dx);
+
+                        double F_elliptic = - sigma_i(0,0) * V_xx - ( sigma_i(0, 0) + sigma_e(0, 0) ) * Ve_xx;
+                        for (unsigned int i = 0; i != elliptic_ndofs; i++)
+                        {
+                            Fe(i) += JxW[qp] * F_elliptic * phi[i][qp];
+                        }
+
+                        double tph = t+h;
+                        double tmh = t-h;
+                        double dVdt = 0.5 * ( exact_solution_V(q_point[qp], tph) - exact_solution_V(q_point[qp], tmh) ) / h;
+                        double I_ion = ionic_model.iion(V);
+                        double F_parabolic = Cm * dVdt + I_ion - sigma_i(0,0) * V_xx - sigma_i(0, 0) * Ve_xx;
+                        for (unsigned int i = 0; i != parabolic_ndofs; i++)
+                        {
+                            Fp(i) += JxW[qp] * F_parabolic * phi[i][qp];
+                        }
+                    }
+                }
+                system.get_vector("F").add_vector(Fe, elliptic_dof_indices);
+                system.get_vector("F").add_vector(Fp, parabolic_dof_indices);
+            }
+            system.get_vector("F").close();
+            break;
+        }
+    }
+    error[0] = std::max(std::sqrt(error_v), error[0]);
+    error[1] = std::max(std::sqrt(error_ve), error[1]);
+    error[2] = std::max(std::sqrt(error_vb), error[2]);
+}
+
+
 void assemble_rhs(  libMesh::EquationSystems &es,
                     const TimeData &timedata,
                     TimeIntegrator time_integrator,
@@ -1054,6 +1414,7 @@ void assemble_rhs(  libMesh::EquationSystems &es,
                 parabolic_system.get_vector("aux1").add(-1.0, parabolic_system.get_vector("In"));
                 // add  M * In
                 parabolic_system.rhs->add_vector(parabolic_system.get_vector("aux1"), parabolic_system.get_matrix("M"));
+                parabolic_system.rhs->add(parabolic_system.get_vector("FV"));
 
                 if(time_integrator == TimeIntegrator::SEMI_IMPLICIT ||
                    time_integrator == TimeIntegrator::SEMI_IMPLICIT_HALF_STEP)
@@ -1066,6 +1427,7 @@ void assemble_rhs(  libMesh::EquationSystems &es,
                 {
                     (*parabolic_system.rhs) /= parabolic_system.get_vector("ML");
                 }
+                // add forcing
 
             }
             else
@@ -1088,6 +1450,8 @@ void assemble_rhs(  libMesh::EquationSystems &es,
                         elliptic_system.rhs->set(elliptic_dof_indices[0], -KiV);
                     }
                 }
+                elliptic_system.rhs->add(elliptic_system.get_vector("FVe"));
+
             }
             break;
         }
@@ -1126,6 +1490,9 @@ void assemble_rhs(  libMesh::EquationSystems &es,
 
             // add  M * In
             system.rhs->add_vector(system.get_vector("aux1"), system.get_matrix("M"));
+            // add forcing
+            system.rhs->add(system.get_vector("F"));
+
             break;
         }
 
@@ -1162,6 +1529,8 @@ void assemble_rhs(  libMesh::EquationSystems &es,
             system.rhs->add_vector(system.get_vector("aux1"), system.get_matrix("M"));
             //system.get_vector("aux1").pointwise_mult(system.get_vector("aux1"), system.get_vector("ML"));
             //*system.rhs += system.get_vector("aux1");
+            // add forcing
+            system.rhs->add(system.get_vector("F"));
             break;
         }
         case TimeIntegrator::SBDF1:
@@ -1190,6 +1559,8 @@ void assemble_rhs(  libMesh::EquationSystems &es,
             system.get_vector("aux1").add(-1.0, system.get_vector("In"));
             // add  M * In
             system.rhs->add_vector(system.get_vector("aux1"), system.get_matrix("M"));
+            // add forcing
+            system.rhs->add(system.get_vector("F"));
             break;
         }
     }
@@ -1295,3 +1666,95 @@ void read_bc_list(std::string &bc, std::set<int> &bc_sidesets)
         std::cout << sideset << ", " << std::flush;
     std::cout << std::endl;
 }
+
+
+double initial_condition_V(const libMesh::Point& p, const double time)
+{
+    return 0;
+}
+double initial_condition_Ve(const libMesh::Point& p, const double time)
+{
+    return 0;
+}
+double exact_solution_V(const libMesh::Point& p, const double time)
+{
+    double x = p(0), y = p(1), z = p(2);
+    double x0 = -.5;
+    double c = .125;
+    double sigma = .125;
+    double delta = .1;
+    double alpha = 50.;
+    double dummy = x0 - x + c*time;
+    double V = tanh(alpha*(dummy))*.5 + .5;
+    return V;
+}
+
+double exact_solution_Ve(const libMesh::Point& p, const double time)
+{
+    double x = p(0), y = p(1), z = p(2);
+    double L = 1.5;
+    double x0 = -.5;
+    double c = .125;
+    double sigma = .125;
+    double delta = .1;
+    double alpha = 50.;
+    double dummy = x0 - x + c*time;
+
+    double sigma6 = sigma * sigma * sigma * sigma * sigma * sigma;
+    double innerPow1 = delta - dummy;
+    double innerPow2 = delta + dummy;
+
+    double exp1 = exp(-pow((innerPow1),6)/sigma6);
+    double exp2 = exp(-pow((innerPow2),6)/sigma6);
+    double Ve = exp1 - exp2;
+    return Ve;
+}
+double exact_solution_Ve_Vb(const libMesh::Point& p, const double time)
+{
+    double Ve = exact_solution_Ve(p, time);
+    double L = 1.5;
+    double x = p(0), y = p(1), z = p(2);
+    double a1 = 8.0/(L*L);
+    double b1 = 16.0/L;
+    double c1 = 8.0;
+    double a2 = -8.0/(L*L);
+    double b2 = -8.0/(L);
+    double c2 = -1.0;
+
+    if( y > 0 )
+    {
+      b1 = -b1;
+      b2 = -b2;
+    }
+
+    double g1 = a1*y*y + b1*y + c1;
+    double g2 = a2*y*y + b2*y + c2;
+    double g = 1.0;
+    if(y <= -0.75*L)
+    {
+          g = g1;
+    }
+    else if(y > -0.75 * L && y < -0.5 * L)
+    {
+          g = g2;
+    }
+    else if(y >= 0.75 * L)
+    {
+          g = g1;
+    }
+    else if(y < 0.75 * L && y > 0.5 * L)
+    {
+          g = g2;
+    }
+    double Vb = Ve * g;
+    return Vb;
+}
+
+
+void exact_solution_monolithic(libMesh::DenseVector<libMesh::Number>& output, const libMesh::Point& p, const double time)
+{
+    output(0) = exact_solution_V(p, time);
+    output(1) = exact_solution_Ve_Vb(p, time);
+}
+
+
