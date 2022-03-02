@@ -33,6 +33,7 @@ stimulus_minz = 0.
 stimulus_duration = 0.5
 stimulus_amplitude =  0.0
 stimulus_start_time = 0.0
+stimulus_type = Transmembrane
 # ionic model
 # cubic: 
 k = 8.0
