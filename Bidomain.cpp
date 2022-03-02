@@ -2275,11 +2275,15 @@ void SolverRecovery (EquationSystems & es, const GetPot &data, TimeData& datatim
   const Real dt = datatime.dt;
   std::string integrator = data("integrator", "SBDF1");
   double zDim = data("maxz", 0.) - data("minz", 0.);
+  double xDim = data("maxx", 0.) - data("minx", 0.);
+  int nelx = data("nelx", 40);
   double IstimD = data("stimulus_duration", 2.);
   double IstimV = data("stimulus_amplitude", -1.);
+  double tissue_maxx = data("tissue_maxx", .5);
+  double tissue_maxy = data("tissue_maxy", .5);
   double stimulus_maxx = data("stimulus_maxx", .5);
+  double stimulus_maxy = data("stimulus_maxy", .5);
   double stimulus_minx = data("stimulus_minx", -.5);
-  double stimulus_maxy = data("stimulus_maxy", 1.);
   double stimulus_miny = data("stimulus_miny", .85);
   double stimulus_maxz = data("stimulus_maxz", 0.0);
   double stimulus_minz = data("stimulus_minz", 0.0);
@@ -2290,6 +2294,7 @@ void SolverRecovery (EquationSystems & es, const GetPot &data, TimeData& datatim
   double u2 = data("v2",1.0);//30;
   double kcubic = data("k", 8.);
   std::string StimPlace = data("stimulus_type", "Transmembrane");
+  int SpiralBool = data("SpiralBool", 0);
   
   TransientExplicitSystem & Rsystem = es.get_system<TransientExplicitSystem> ("Recovery");
   Rsystem.solution -> close();
@@ -2342,6 +2347,30 @@ void SolverRecovery (EquationSystems & es, const GetPot &data, TimeData& datatim
   double c_so = .02;
 
 
+  double phi [1000] = {};
+  double x1 [1000] = {};
+  double y1 [1000] = {};
+  double threshSpiral = (xDim*2.5/ (double)nelx);
+
+  if(SpiralBool == 1 || SpiralBool == 2){
+      //spiral wave change for variables: parameter set 1 Fenton et al 2002
+      tau_v_plus = 3.33;
+      tau_v1_minus = 19.6;
+      tau_v2_minus = 1000.0;
+      tau_w_plus = 667.0;
+      tau_w1_minus = 11.0;
+      tau_w2_minus = 11.0;
+      tau_d = .25;
+      tau_si = 45.;
+      tau_o = 8.3;
+      tau_a = .02; //tau_a = 1/tau_r
+      k = 10.;
+      u_csi = .85;
+      u_c = .13;
+      u_v = .055;
+
+    }
+
 
   
   if(integrator.compare(0,4,"SBDF") == 0){
@@ -2352,109 +2381,89 @@ void SolverRecovery (EquationSystems & es, const GetPot &data, TimeData& datatim
     const DofMap & dof_map = Bsystem.get_dof_map();
 
 
-  for(const auto & node : mesh.local_node_ptr_range()){
+    for(const auto & node : mesh.local_node_ptr_range()){
 
-    dof_map.dof_indices (node, dof_indices);
-    dof_map2.dof_indices (node, dof_indices2);
+        dof_map.dof_indices (node, dof_indices);
+        dof_map2.dof_indices (node, dof_indices2);
 
-    const Real x = (*node)(0);
-    const Real y = (*node)(1);
-    const Real z = (*node)(2);
+        const Real x = (*node)(0);
+        const Real y = (*node)(1);
+        const Real z = (*node)(2);
 
-    if(dof_indices2.size() > 0){
+        if(dof_indices2.size() > 0){
 
-
-      if(time == dt){
-        v_old = 1.;
-        w_old = 1.;
-        s_old = 0.;
-        u_old = (*Bsystem.current_local_solution)  (dof_indices[u_var]);
-
-
-      }
-      else{
-        v_old = (*Rsystem.current_local_solution) (dof_indices2[v_var]);
-        w_old = (*Rsystem.current_local_solution) (dof_indices2[w_var]);        
-        s_old = (*Rsystem.current_local_solution) (dof_indices2[s_var]);        
-        u_old = (*Bsystem.current_local_solution)  (dof_indices[u_var]);
-            u_old_old = (Bsystem.get_vector("Vnm1"))  (dof_indices[0]);
-            u_old_old_old = (Bsystem.get_vector("Vnm2"))  (dof_indices[0]);
-            v_old_old = (Rsystem.get_vector("v_prev")) (dof_indices2[0]);
-            v_old_old_old = (Rsystem.get_vector("v_prev_prev")) (dof_indices2[0]);
-            w_old_old = (Rsystem.get_vector("w_prev")) (dof_indices2[0]);
-            w_old_old_old = (Rsystem.get_vector("w_prev_prev")) (dof_indices2[0]);
-            s_old_old = (Rsystem.get_vector("s_prev")) (dof_indices2[0]);
-            s_old_old_old = (Rsystem.get_vector("s_prev_prev")) (dof_indices2[0]);
-        
-
-      }
-
-
-      if(integrator.compare(0,5,"SBDF3") == 0){
-
-          if(time == dt){
-              double RhsV = ( ((1.0 - HofX(u_old,u_c))*(1.0 - v_old))/(tau_v2_minus*HofX(u_old,u_v) + tau_v1_minus*(1.0 - HofX(u_old,u_v)))) - ((HofX(u_old,u_c)*v_old)/(tau_v_plus));
-              double RhsW = ( ((1.0 - HofX(u_old,u_c))*(1.0 - w_old))/(tau_w2_minus*HofX(u_old,u_w) + tau_w1_minus*(1.0 - HofX(u_old,u_w)))) - ((HofX(u_old,u_c)*w_old)/(tau_w_plus));
-              double RhsS = (r_s_plus*(HofX(u_old,u_c)) + r_s_minus*(1.0 - HofX(u_old,u_c))) * (.5*(1.0 + tanh(k*(u_old - u_csi))) - s_old);
-
-              v_new = v_old + dt*RhsV;
-              Rsystem.solution -> set(dof_indices2[v_var],v_new);
-              w_new = w_old + dt*RhsW;
-              Rsystem.solution -> set(dof_indices2[w_var],w_new);
-              s_new = s_old + dt*RhsS;
-              Rsystem.solution -> set(dof_indices2[s_var],s_new);
-          }
-          else if(time == 2.*dt){
-              double RhsV = ( ((1.0 - HofX(u_old,u_c))*(1.0 - v_old))/(tau_v2_minus*HofX(u_old,u_v) + tau_v1_minus*(1.0 - HofX(u_old,u_v)))) - ((HofX(u_old,u_c)*v_old)/(tau_v_plus));
-              double RhsW = ( ((1.0 - HofX(u_old,u_c))*(1.0 - w_old))/(tau_w2_minus*HofX(u_old,u_w) + tau_w1_minus*(1.0 - HofX(u_old,u_w)))) - ((HofX(u_old,u_c)*w_old)/(tau_w_plus));
-              double RhsS = (r_s_plus*(HofX(u_old,u_c)) + r_s_minus*(1.0 - HofX(u_old,u_c))) * (.5*(1.0 + tanh(k*(u_old - u_csi))) - s_old);
-
-              double RhsV_old = ( ((1.0 - HofX(u_old_old,u_c))*(1.0 - v_old_old))/(tau_v2_minus*HofX(u_old_old,u_v) + tau_v1_minus*(1.0 - HofX(u_old_old,u_v)))) - ((HofX(u_old_old,u_c)*v_old_old)/(tau_v_plus));
-              double RhsW_old = ( ((1.0 - HofX(u_old_old,u_c))*(1.0 - w_old_old))/(tau_w2_minus*HofX(u_old_old,u_w) + tau_w1_minus*(1.0 - HofX(u_old_old,u_w)))) - ((HofX(u_old_old,u_c)*w_old_old)/(tau_w_plus));
-              double RhsS_old = (r_s_plus*(HofX(u_old_old,u_c)) + r_s_minus*(1.0 - HofX(u_old_old,u_c))) * (.5*(1.0 + tanh(k*(u_old_old - u_csi))) - s_old_old);
-
-
-              v_new = (4.0/3.)*v_old - (1.0/3.)*v_old_old + (4.0/3.)*dt*RhsV -(2.0/3.)*dt*RhsV_old;
-              Rsystem.solution -> set(dof_indices2[v_var],v_new);
-              Rsystem.get_vector("v_prev").set(dof_indices2[0],v_old);
-              w_new = (4.0/3.)*w_old - (1.0/3.)*w_old_old + (4.0/3.)*dt*RhsW -(2.0/3.)*dt*RhsW_old;
-              Rsystem.get_vector("w_prev").set(dof_indices2[0],w_old);
-              Rsystem.solution -> set(dof_indices2[w_var],w_new);
-              s_new = (4.0/3.)*s_old - (1.0/3.)*s_old_old + (4.0/3.)*dt*RhsS -(2.0/3.)*dt*RhsS_old;
-              Rsystem.get_vector("s_prev").set(dof_indices2[0],s_old);
-              Rsystem.solution -> set(dof_indices2[s_var],s_new);
-          }
-          else{
-              double RhsV = ( ((1.0 - HofX(u_old,u_c))*(1.0 - v_old))/(tau_v2_minus*HofX(u_old,u_v) + tau_v1_minus*(1.0 - HofX(u_old,u_v)))) - ((HofX(u_old,u_c)*v_old)/(tau_v_plus));
-              double RhsW = ( ((1.0 - HofX(u_old,u_c))*(1.0 - w_old))/(tau_w2_minus*HofX(u_old,u_w) + tau_w1_minus*(1.0 - HofX(u_old,u_w)))) - ((HofX(u_old,u_c)*w_old)/(tau_w_plus));
-              double RhsS = (r_s_plus*(HofX(u_old,u_c)) + r_s_minus*(1.0 - HofX(u_old,u_c))) * (.5*(1.0 + tanh(k*(u_old - u_csi))) - s_old);
-
-              double RhsV_old = ( ((1.0 - HofX(u_old_old,u_c))*(1.0 - v_old_old))/(tau_v2_minus*HofX(u_old_old,u_v) + tau_v1_minus*(1.0 - HofX(u_old_old,u_v)))) - ((HofX(u_old_old,u_c)*v_old_old)/(tau_v_plus));
-              double RhsW_old = ( ((1.0 - HofX(u_old_old,u_c))*(1.0 - w_old_old))/(tau_w2_minus*HofX(u_old_old,u_w) + tau_w1_minus*(1.0 - HofX(u_old_old,u_w)))) - ((HofX(u_old_old,u_c)*w_old_old)/(tau_w_plus));
-              double RhsS_old = (r_s_plus*(HofX(u_old_old,u_c)) + r_s_minus*(1.0 - HofX(u_old_old,u_c))) * (.5*(1.0 + tanh(k*(u_old_old - u_csi))) - s_old_old);
-
-              double RhsV_old_old = ( ((1.0 - HofX(u_old_old_old,u_c))*(1.0 - v_old_old_old))/(tau_v2_minus*HofX(u_old_old_old,u_v) + tau_v1_minus*(1.0 - HofX(u_old_old_old,u_v)))) - ((HofX(u_old_old_old,u_c)*v_old_old_old)/(tau_v_plus));
-              double RhsW_old_old = ( ((1.0 - HofX(u_old_old_old,u_c))*(1.0 - w_old_old_old))/(tau_w2_minus*HofX(u_old_old_old,u_w) + tau_w1_minus*(1.0 - HofX(u_old_old_old,u_w)))) - ((HofX(u_old_old_old,u_c)*w_old_old_old)/(tau_w_plus));
-              double RhsS_old_old = (r_s_plus*(HofX(u_old_old_old,u_c)) + r_s_minus*(1.0 - HofX(u_old_old_old,u_c))) * (.5*(1.0 + tanh(k*(u_old_old_old - u_csi))) - s_old_old_old);
-
-              v_new = (18.0/11.)*v_old - (18.0/22.)*v_old_old + (6.0/33.)*v_old_old_old + (18.0/11.)*dt*RhsV - (18.0/11.)*dt*RhsV_old + (6.0/11.)*dt*RhsV_old_old;
-              Rsystem.solution -> set(dof_indices2[v_var],v_new);
-              Rsystem.get_vector("v_prev").set(dof_indices2[0],v_old);
-              Rsystem.get_vector("v_prev_prev").set(dof_indices2[0],v_old_old);
-              w_new = (18.0/11.)*w_old - (18.0/22.)*w_old_old + (6.0/33.)*w_old_old_old + (18.0/11.)*dt*RhsW - (18.0/11.)*dt*RhsW_old + (6.0/11.)*dt*RhsW_old_old;
-              Rsystem.get_vector("w_prev").set(dof_indices2[0],w_old);
-              Rsystem.get_vector("w_prev_prev").set(dof_indices2[0],w_old_old);
-              Rsystem.solution -> set(dof_indices2[w_var],w_new);
-              s_new = (18.0/11.)*s_old - (18.0/22.)*s_old_old + (6.0/33.)*s_old_old_old + (18.0/11.)*dt*RhsS - (18.0/11.)*dt*RhsS_old + (6.0/11.)*dt*RhsS_old_old;
-              Rsystem.get_vector("s_prev").set(dof_indices2[0],s_old);
-              Rsystem.get_vector("s_prev_prev").set(dof_indices2[0],s_old_old);
-              Rsystem.solution -> set(dof_indices2[s_var],s_new);
-            }
-
-      }
-      else if(integrator.compare(0,5,"SBDF2") == 0){
 
             if(time == dt){
+                v_old = 1.;
+                w_old = 1.;
+                s_old = 0.;
+                u_old = (*Bsystem.current_local_solution)  (dof_indices[u_var]);
+
+                if(SpiralBool == 1){
+                    if( y < 0){
+                        v_old = 0.;
+                        w_old = 0.;
+                        s_old = 1.;
+                        u_old = 1.;
+                    }
+                }
+
+                else if(SpiralBool == 2){
+
+                    double a = .5;
+                    double k = .09;
+                    int thickness = 15;
+                    int finalDim = thickness*1000; //15,000
+                    double bathRegion = xDim/2.0 - tissue_maxx;
+                    double factorAxis = 3.0*(xDim/2.-bathRegion);
+                    phi[0] = 0.;
+                    x1[0] = -a*exp(k*phi[0])*cos(phi[0]);
+                    y1[0] = -a*exp(k*phi[0])*sin(phi[0]);
+                    for(int i = 1; i < 1000; i++){
+                        phi[i] = phi[i-1] + ((factorAxis*acos(-1) - phi[0])/1000.);
+                        x1[i] = -a*exp(k*phi[i])*cos(phi[i]);
+                        y1[i] = -a*exp(k*phi[i])*sin(phi[i]);
+                    }
+                    for(int i = 0; i < 1000; i++){
+                        if( std::abs(x - x1[i]) <= threshSpiral && std::abs(y - y1[i]) <= threshSpiral){
+                            //conditions in notes seen from paraview
+                            /*
+                             * initial conditions for multiple spirals to happen:
+                                u - spiral of 1. and rest of 0
+                                v - inverse of spiral of 1. and rest of 0
+                                w - spiral of .8 and rest of 1.
+                                s - same spiral of .1 and rest of 0
+                            */
+                            v_old = 0.;
+                            w_old = 0.;
+                            s_old = 1.;
+                            u_old = 1.;
+                            //libMesh::out << "HERE --> x = " << x << ";     y = " << y << ";    with threshold of the spiral: " << threshSpiral << std::endl;
+                        }
+                    }
+                }
+
+
+            }
+            else{
+                v_old = (*Rsystem.current_local_solution) (dof_indices2[v_var]);
+                w_old = (*Rsystem.current_local_solution) (dof_indices2[w_var]);        
+                s_old = (*Rsystem.current_local_solution) (dof_indices2[s_var]);        
+                u_old = (*Bsystem.current_local_solution)  (dof_indices[u_var]);
+                u_old_old = (Bsystem.get_vector("Vnm1"))  (dof_indices[0]);
+                u_old_old_old = (Bsystem.get_vector("Vnm2"))  (dof_indices[0]);
+                v_old_old = (Rsystem.get_vector("v_prev")) (dof_indices2[0]);
+                v_old_old_old = (Rsystem.get_vector("v_prev_prev")) (dof_indices2[0]);
+                w_old_old = (Rsystem.get_vector("w_prev")) (dof_indices2[0]);
+                w_old_old_old = (Rsystem.get_vector("w_prev_prev")) (dof_indices2[0]);
+                s_old_old = (Rsystem.get_vector("s_prev")) (dof_indices2[0]);
+                s_old_old_old = (Rsystem.get_vector("s_prev_prev")) (dof_indices2[0]);
+            }
+
+
+            if(integrator.compare(0,5,"SBDF3") == 0){
+
+                if(time == dt){
                   double RhsV = ( ((1.0 - HofX(u_old,u_c))*(1.0 - v_old))/(tau_v2_minus*HofX(u_old,u_v) + tau_v1_minus*(1.0 - HofX(u_old,u_v)))) - ((HofX(u_old,u_c)*v_old)/(tau_v_plus));
                   double RhsW = ( ((1.0 - HofX(u_old,u_c))*(1.0 - w_old))/(tau_w2_minus*HofX(u_old,u_w) + tau_w1_minus*(1.0 - HofX(u_old,u_w)))) - ((HofX(u_old,u_c)*w_old)/(tau_w_plus));
                   double RhsS = (r_s_plus*(HofX(u_old,u_c)) + r_s_minus*(1.0 - HofX(u_old,u_c))) * (.5*(1.0 + tanh(k*(u_old - u_csi))) - s_old);
@@ -2465,9 +2474,8 @@ void SolverRecovery (EquationSystems & es, const GetPot &data, TimeData& datatim
                   Rsystem.solution -> set(dof_indices2[w_var],w_new);
                   s_new = s_old + dt*RhsS;
                   Rsystem.solution -> set(dof_indices2[s_var],s_new);
-              }
-            else{
-
+                }
+                else if(time == 2.*dt){
                   double RhsV = ( ((1.0 - HofX(u_old,u_c))*(1.0 - v_old))/(tau_v2_minus*HofX(u_old,u_v) + tau_v1_minus*(1.0 - HofX(u_old,u_v)))) - ((HofX(u_old,u_c)*v_old)/(tau_v_plus));
                   double RhsW = ( ((1.0 - HofX(u_old,u_c))*(1.0 - w_old))/(tau_w2_minus*HofX(u_old,u_w) + tau_w1_minus*(1.0 - HofX(u_old,u_w)))) - ((HofX(u_old,u_c)*w_old)/(tau_w_plus));
                   double RhsS = (r_s_plus*(HofX(u_old,u_c)) + r_s_minus*(1.0 - HofX(u_old,u_c))) * (.5*(1.0 + tanh(k*(u_old - u_csi))) - s_old);
@@ -2486,90 +2494,160 @@ void SolverRecovery (EquationSystems & es, const GetPot &data, TimeData& datatim
                   s_new = (4.0/3.)*s_old - (1.0/3.)*s_old_old + (4.0/3.)*dt*RhsS -(2.0/3.)*dt*RhsS_old;
                   Rsystem.get_vector("s_prev").set(dof_indices2[0],s_old);
                   Rsystem.solution -> set(dof_indices2[s_var],s_new);
+                }
+                else{
+                  double RhsV = ( ((1.0 - HofX(u_old,u_c))*(1.0 - v_old))/(tau_v2_minus*HofX(u_old,u_v) + tau_v1_minus*(1.0 - HofX(u_old,u_v)))) - ((HofX(u_old,u_c)*v_old)/(tau_v_plus));
+                  double RhsW = ( ((1.0 - HofX(u_old,u_c))*(1.0 - w_old))/(tau_w2_minus*HofX(u_old,u_w) + tau_w1_minus*(1.0 - HofX(u_old,u_w)))) - ((HofX(u_old,u_c)*w_old)/(tau_w_plus));
+                  double RhsS = (r_s_plus*(HofX(u_old,u_c)) + r_s_minus*(1.0 - HofX(u_old,u_c))) * (.5*(1.0 + tanh(k*(u_old - u_csi))) - s_old);
+
+                  double RhsV_old = ( ((1.0 - HofX(u_old_old,u_c))*(1.0 - v_old_old))/(tau_v2_minus*HofX(u_old_old,u_v) + tau_v1_minus*(1.0 - HofX(u_old_old,u_v)))) - ((HofX(u_old_old,u_c)*v_old_old)/(tau_v_plus));
+                  double RhsW_old = ( ((1.0 - HofX(u_old_old,u_c))*(1.0 - w_old_old))/(tau_w2_minus*HofX(u_old_old,u_w) + tau_w1_minus*(1.0 - HofX(u_old_old,u_w)))) - ((HofX(u_old_old,u_c)*w_old_old)/(tau_w_plus));
+                  double RhsS_old = (r_s_plus*(HofX(u_old_old,u_c)) + r_s_minus*(1.0 - HofX(u_old_old,u_c))) * (.5*(1.0 + tanh(k*(u_old_old - u_csi))) - s_old_old);
+
+                  double RhsV_old_old = ( ((1.0 - HofX(u_old_old_old,u_c))*(1.0 - v_old_old_old))/(tau_v2_minus*HofX(u_old_old_old,u_v) + tau_v1_minus*(1.0 - HofX(u_old_old_old,u_v)))) - ((HofX(u_old_old_old,u_c)*v_old_old_old)/(tau_v_plus));
+                  double RhsW_old_old = ( ((1.0 - HofX(u_old_old_old,u_c))*(1.0 - w_old_old_old))/(tau_w2_minus*HofX(u_old_old_old,u_w) + tau_w1_minus*(1.0 - HofX(u_old_old_old,u_w)))) - ((HofX(u_old_old_old,u_c)*w_old_old_old)/(tau_w_plus));
+                  double RhsS_old_old = (r_s_plus*(HofX(u_old_old_old,u_c)) + r_s_minus*(1.0 - HofX(u_old_old_old,u_c))) * (.5*(1.0 + tanh(k*(u_old_old_old - u_csi))) - s_old_old_old);
+
+                  v_new = (18.0/11.)*v_old - (18.0/22.)*v_old_old + (6.0/33.)*v_old_old_old + (18.0/11.)*dt*RhsV - (18.0/11.)*dt*RhsV_old + (6.0/11.)*dt*RhsV_old_old;
+                  Rsystem.solution -> set(dof_indices2[v_var],v_new);
+                  Rsystem.get_vector("v_prev").set(dof_indices2[0],v_old);
+                  Rsystem.get_vector("v_prev_prev").set(dof_indices2[0],v_old_old);
+                  w_new = (18.0/11.)*w_old - (18.0/22.)*w_old_old + (6.0/33.)*w_old_old_old + (18.0/11.)*dt*RhsW - (18.0/11.)*dt*RhsW_old + (6.0/11.)*dt*RhsW_old_old;
+                  Rsystem.get_vector("w_prev").set(dof_indices2[0],w_old);
+                  Rsystem.get_vector("w_prev_prev").set(dof_indices2[0],w_old_old);
+                  Rsystem.solution -> set(dof_indices2[w_var],w_new);
+                  s_new = (18.0/11.)*s_old - (18.0/22.)*s_old_old + (6.0/33.)*s_old_old_old + (18.0/11.)*dt*RhsS - (18.0/11.)*dt*RhsS_old + (6.0/11.)*dt*RhsS_old_old;
+                  Rsystem.get_vector("s_prev").set(dof_indices2[0],s_old);
+                  Rsystem.get_vector("s_prev_prev").set(dof_indices2[0],s_old_old);
+                  Rsystem.solution -> set(dof_indices2[s_var],s_new);
+                }
+
+            }
+            else if(integrator.compare(0,5,"SBDF2") == 0){
+
+                if(time == dt){
+                  double RhsV = ( ((1.0 - HofX(u_old,u_c))*(1.0 - v_old))/(tau_v2_minus*HofX(u_old,u_v) + tau_v1_minus*(1.0 - HofX(u_old,u_v)))) - ((HofX(u_old,u_c)*v_old)/(tau_v_plus));
+                  double RhsW = ( ((1.0 - HofX(u_old,u_c))*(1.0 - w_old))/(tau_w2_minus*HofX(u_old,u_w) + tau_w1_minus*(1.0 - HofX(u_old,u_w)))) - ((HofX(u_old,u_c)*w_old)/(tau_w_plus));
+                  double RhsS = (r_s_plus*(HofX(u_old,u_c)) + r_s_minus*(1.0 - HofX(u_old,u_c))) * (.5*(1.0 + tanh(k*(u_old - u_csi))) - s_old);
+
+                  v_new = v_old + dt*RhsV;
+                  Rsystem.solution -> set(dof_indices2[v_var],v_new);
+                  w_new = w_old + dt*RhsW;
+                  Rsystem.solution -> set(dof_indices2[w_var],w_new);
+                  s_new = s_old + dt*RhsS;
+                  Rsystem.solution -> set(dof_indices2[s_var],s_new);
+                }
+                else{
+                  double RhsV = ( ((1.0 - HofX(u_old,u_c))*(1.0 - v_old))/(tau_v2_minus*HofX(u_old,u_v) + tau_v1_minus*(1.0 - HofX(u_old,u_v)))) - ((HofX(u_old,u_c)*v_old)/(tau_v_plus));
+                  double RhsW = ( ((1.0 - HofX(u_old,u_c))*(1.0 - w_old))/(tau_w2_minus*HofX(u_old,u_w) + tau_w1_minus*(1.0 - HofX(u_old,u_w)))) - ((HofX(u_old,u_c)*w_old)/(tau_w_plus));
+                  double RhsS = (r_s_plus*(HofX(u_old,u_c)) + r_s_minus*(1.0 - HofX(u_old,u_c))) * (.5*(1.0 + tanh(k*(u_old - u_csi))) - s_old);
+
+                  double RhsV_old = ( ((1.0 - HofX(u_old_old,u_c))*(1.0 - v_old_old))/(tau_v2_minus*HofX(u_old_old,u_v) + tau_v1_minus*(1.0 - HofX(u_old_old,u_v)))) - ((HofX(u_old_old,u_c)*v_old_old)/(tau_v_plus));
+                  double RhsW_old = ( ((1.0 - HofX(u_old_old,u_c))*(1.0 - w_old_old))/(tau_w2_minus*HofX(u_old_old,u_w) + tau_w1_minus*(1.0 - HofX(u_old_old,u_w)))) - ((HofX(u_old_old,u_c)*w_old_old)/(tau_w_plus));
+                  double RhsS_old = (r_s_plus*(HofX(u_old_old,u_c)) + r_s_minus*(1.0 - HofX(u_old_old,u_c))) * (.5*(1.0 + tanh(k*(u_old_old - u_csi))) - s_old_old);
+
+
+                  v_new = (4.0/3.)*v_old - (1.0/3.)*v_old_old + (4.0/3.)*dt*RhsV -(2.0/3.)*dt*RhsV_old;
+                  Rsystem.solution -> set(dof_indices2[v_var],v_new);
+                  Rsystem.get_vector("v_prev").set(dof_indices2[0],v_old);
+                  w_new = (4.0/3.)*w_old - (1.0/3.)*w_old_old + (4.0/3.)*dt*RhsW -(2.0/3.)*dt*RhsW_old;
+                  Rsystem.get_vector("w_prev").set(dof_indices2[0],w_old);
+                  Rsystem.solution -> set(dof_indices2[w_var],w_new);
+                  s_new = (4.0/3.)*s_old - (1.0/3.)*s_old_old + (4.0/3.)*dt*RhsS -(2.0/3.)*dt*RhsS_old;
+                  Rsystem.get_vector("s_prev").set(dof_indices2[0],s_old);
+                  Rsystem.solution -> set(dof_indices2[s_var],s_new);
+                }
+
+            }
+            else{
+
+                  double RhsV = ( ((1.0 - HofX(u_old,u_c))*(1.0 - v_old))/(tau_v2_minus*HofX(u_old,u_v) + tau_v1_minus*(1.0 - HofX(u_old,u_v)))) - ((HofX(u_old,u_c)*v_old)/(tau_v_plus));
+                  double RhsW = ( ((1.0 - HofX(u_old,u_c))*(1.0 - w_old))/(tau_w2_minus*HofX(u_old,u_w) + tau_w1_minus*(1.0 - HofX(u_old,u_w)))) - ((HofX(u_old,u_c)*w_old)/(tau_w_plus));
+                  double RhsS = (r_s_plus*(HofX(u_old,u_c)) + r_s_minus*(1.0 - HofX(u_old,u_c))) * (.5*(1.0 + tanh(k*(u_old - u_csi))) - s_old);
+
+                  v_new = v_old + dt*RhsV;
+                  Rsystem.solution -> set(dof_indices2[v_var],v_new);
+                  w_new = w_old + dt*RhsW;
+                  Rsystem.solution -> set(dof_indices2[w_var],w_new);
+                  s_new = s_old + dt*RhsS;
+                  Rsystem.solution -> set(dof_indices2[s_var],s_new);
             }
 
-    }
-      else{
+            double freact = 0.0;
+            double Ifival = (-v_old*HofX(u_old,u_c)*(u_old-u_c)*(u_m-u_old)) / (tau_d);
+            double Isival = (-w_old*s_old) / (tau_si);
+            double Isoval = (((u_old-u_o)*(1.0 - HofX(u_old,u_so))) / tau_o) + HofX(u_old,u_so)*tau_a + .5*(a_so-tau_a)*(1.0 + tanh((u_old - b_so)/(c_so)));
 
-          double RhsV = ( ((1.0 - HofX(u_old,u_c))*(1.0 - v_old))/(tau_v2_minus*HofX(u_old,u_v) + tau_v1_minus*(1.0 - HofX(u_old,u_v)))) - ((HofX(u_old,u_c)*v_old)/(tau_v_plus));
-          double RhsW = ( ((1.0 - HofX(u_old,u_c))*(1.0 - w_old))/(tau_w2_minus*HofX(u_old,u_w) + tau_w1_minus*(1.0 - HofX(u_old,u_w)))) - ((HofX(u_old,u_c)*w_old)/(tau_w_plus));
-          double RhsS = (r_s_plus*(HofX(u_old,u_c)) + r_s_minus*(1.0 - HofX(u_old,u_c))) * (.5*(1.0 + tanh(k*(u_old - u_csi))) - s_old);
+            double Istim = 0.0;
+            double Istim2 = 0.0;
 
-          v_new = v_old + dt*RhsV;
-          Rsystem.solution -> set(dof_indices2[v_var],v_new);
-          w_new = w_old + dt*RhsW;
-          Rsystem.solution -> set(dof_indices2[w_var],w_new);
-          s_new = s_old + dt*RhsS;
-          Rsystem.solution -> set(dof_indices2[s_var],s_new);
-    }
+            if(SpiralBool == 0){
+                if( zDim == 0. ){
+                    if(time < IstimD && time > stimulus_start_time && y > stimulus_miny && y < stimulus_maxy && x > stimulus_minx && x < stimulus_maxx){
+                      Istim = IstimV;//with TIME < 1.2, -.08 is the minimum current stimulus to initiate AP propagation
+                      //libMesh::out << x << std::endl;
+                    }
+                }
+                else{
+                    if(time < IstimD && time > stimulus_start_time && y > stimulus_miny && y < stimulus_maxy && x > stimulus_minx && x < stimulus_maxx && z > stimulus_minz && z < stimulus_maxz){
+                      Istim = IstimV;//with TIME < 1.2, -.08 is the minimum current stimulus to initiate AP propagation
+                      //libMesh::out << x << std::endl;
+                    }
+                }
+                if(convergence_test){
+                  freact = -kcubic*((u_old - u0)*(u_old - u1)*(u_old - u2));// - 1*r_new*(u_old-u0)) - Istim  - Istim2;
+                }
+                else{
+                    if(StimPlace.compare(0,13,"Transmembrane") == 0){
+                        freact = (-(Ifival + Isival + Isoval)) - Istim  - Istim2;
+                    }
+                    else{
+                        freact = (-(Ifival + Isival + Isoval));
+                    }
+                }
+            }
+
+            else if(SpiralBool == 1){
+                if(time < IstimD && x < 0. && y > 0.){
+                    Istim = IstimV;//with TIME < 1.2, -.08 is the minimum current stimulus to initiate AP propagation
+                //libMesh::out << Istim << std::endl;
+                }
+                freact = (-(Ifival + Isival + Isoval)) - Istim  - Istim2;
+            }
+
+            else if(SpiralBool == 2){
+                if(time < IstimD &&  y > tissue_maxy - 0.15 ){
+                    Istim = IstimV*1.;//with TIME < 1.2, -.08 is the minimum current stimulus to initiate AP propagation
+                    //libMesh::out << Istim << std::endl;
+                }
+                if(time < IstimD &&  x > tissue_maxx - 0.15 ){
+                    Istim = IstimV*1.;//with TIME < 1.2, -.08 is the minimum current stimulus to initiate AP propagation
+                    //libMesh::out << Istim << std::endl;
+                }
+                freact = (-(Ifival + Isival + Isoval)) - Istim  - Istim2;
+            }
 
 
 
 
-    double freact = 0.0;
-    double Ifival = (-v_old*HofX(u_old,u_c)*(u_old-u_c)*(u_m-u_old)) / (tau_d);
-    double Isival = (-w_old*s_old) / (tau_si);
-    double Isoval = (((u_old-u_o)*(1.0 - HofX(u_old,u_so))) / tau_o) + HofX(u_old,u_so)*tau_a + .5*(a_so-tau_a)*(1.0 + tanh((u_old - b_so)/(c_so)));
+            
+            //libMesh::out << freact << "    " << x << "    " << dof_indices[0] << std::endl;
+            //libMesh::out << x << std::endl;
 
-    double Istim = 0.0;
-    double Istim2 = 0.0;
 
-    if( zDim == 0. ){
-        if(time < IstimD && time > stimulus_start_time && y > stimulus_miny && y < stimulus_maxy && x > stimulus_minx && x < stimulus_maxx){
-          Istim = IstimV;//with TIME < 1.2, -.08 is the minimum current stimulus to initiate AP propagation
-          //libMesh::out << x << std::endl;
+            Bsystem.get_vector("In").set(dof_indices[u_var], freact);           
+
+
+
         }
-    }
-    else{
-        if(time < IstimD && time > stimulus_start_time && y > stimulus_miny && y < stimulus_maxy && x > stimulus_minx && x < stimulus_maxx && z > stimulus_minz && z < stimulus_maxz){
-          Istim = IstimV;//with TIME < 1.2, -.08 is the minimum current stimulus to initiate AP propagation
-          //libMesh::out << x << std::endl;
-        }
-    }
-
-
-    /*
-    if(time > 8.5 && time < 10 && x > 1 && y > .5){
-      Istim2 = 0;//-3.5;
-    }
-    */
-
-    //freact = -8*(u_old*(u_old-1)*(u_old - 0.05)) - Istim - r_new*u_old - Istim2;
-    //freact = (-(Ifival + Isival + Isoval)) - Istim  - Istim2;
-
-    //u_old =
-    if(convergence_test){
-      freact = -kcubic*((u_old - u0)*(u_old - u1)*(u_old - u2));// - 1*r_new*(u_old-u0)) - Istim  - Istim2;
-    }
-    else{
-        if(StimPlace.compare(0,13,"Transmembrane") == 0){
-            freact = (-(Ifival + Isival + Isoval)) - Istim  - Istim2;
-        }
-        else{
-            freact = (-(Ifival + Isival + Isoval));
-        }
-    }
-    //libMesh::out << freact << "    " << x << "    " << dof_indices[0] << std::endl;
-    //libMesh::out << x << std::endl;
-
-
-    Bsystem.get_vector("In").set(dof_indices[u_var], freact);
-
-
 
     }
-
-  }
-  Bsystem.get_vector("In").close();
-  Bsystem.get_vector("Inm1").close();
+    Bsystem.get_vector("In").close();
+    Bsystem.get_vector("Inm1").close();
   //Rsystem.get_vector("Rvalues") = Rnew;
   
 
   }
-
-
-
-
 
 
 
@@ -2582,32 +2660,74 @@ void SolverRecovery (EquationSystems & es, const GetPot &data, TimeData& datatim
     const DofMap & dof_map = Bsystem.get_dof_map();
 
 
-  for(const auto & node : mesh.local_node_ptr_range()){
+    for(const auto & node : mesh.local_node_ptr_range()){
 
-    dof_map.dof_indices (node, dof_indices);
-    dof_map2.dof_indices (node, dof_indices2);
+        dof_map.dof_indices (node, dof_indices);
+        dof_map2.dof_indices (node, dof_indices2);
 
-    const Real x = (*node)(0);
-    const Real y = (*node)(1);
-    const Real z = (*node)(2);
+        const Real x = (*node)(0);
+        const Real y = (*node)(1);
+        const Real z = (*node)(2);
 
-    if(dof_indices2.size() > 0){
+        if(dof_indices2.size() > 0){
 
+          if(time == dt){
+            v_old = 1.;
+            w_old = 1.;
+            s_old = 0.;
+            u_old = (*Bsystem.current_local_solution)  (dof_indices[u_var]);
 
-      if(time == dt){
-        v_old = 1.;
-        w_old = 1.;
-        s_old = 0.;
-        u_old = (*Bsystem.current_local_solution)  (dof_indices[u_var]);
+            if(SpiralBool == 1){
+                if( y < 0){
+                    v_old = 0.;
+                    w_old = 0.;
+                    s_old = 1.;
+                    u_old = 1.;
+                }
+            }
 
+            else if(SpiralBool == 2){
 
-      }
-      else{
-        v_old = (*Rsystem.current_local_solution) (dof_indices2[v_var]);
-        w_old = (*Rsystem.current_local_solution) (dof_indices2[w_var]);        
-        s_old = (*Rsystem.current_local_solution) (dof_indices2[s_var]);        
-        u_old = (*Bsystem.current_local_solution)  (dof_indices[u_var]);
-      }
+                double a = .5;
+                double k = .09;
+                int thickness = 15;
+                int finalDim = thickness*1000; //15,000
+                double bathRegion = xDim/2.0 - tissue_maxx;
+                double factorAxis = 3.0*(xDim/2.-bathRegion);
+                phi[0] = 0.;
+                x1[0] = -a*exp(k*phi[0])*cos(phi[0]);
+                y1[0] = -a*exp(k*phi[0])*sin(phi[0]);
+                for(int i = 1; i < 1000; i++){
+                    phi[i] = phi[i-1] + ((factorAxis*acos(-1) - phi[0])/1000.);
+                    x1[i] = -a*exp(k*phi[i])*cos(phi[i]);
+                    y1[i] = -a*exp(k*phi[i])*sin(phi[i]);
+                }
+                for(int i = 0; i < 1000; i++){
+                    if( std::abs(x - x1[i]) <= threshSpiral && std::abs(y - y1[i]) <= threshSpiral){
+                        //conditions in notes seen from paraview
+                        /*
+                         * initial conditions for multiple spirals to happen:
+                            u - spiral of 1. and rest of 0
+                            v - inverse of spiral of 1. and rest of 0
+                            w - spiral of .8 and rest of 1.
+                            s - same spiral of .1 and rest of 0
+                        */
+                        v_old = 0.;
+                        w_old = 0.;
+                        s_old = 1.;
+                        u_old = 1.;
+                        //libMesh::out << "HERE --> x = " << x << ";     y = " << y << ";    with threshold of the spiral: " << threshSpiral << std::endl;
+                    }
+                }
+            }
+
+          }
+          else{
+            v_old = (*Rsystem.current_local_solution) (dof_indices2[v_var]);
+            w_old = (*Rsystem.current_local_solution) (dof_indices2[w_var]);        
+            s_old = (*Rsystem.current_local_solution) (dof_indices2[s_var]);        
+            u_old = (*Bsystem.current_local_solution)  (dof_indices[u_var]);
+          }
 
           double RhsV = ( ((1.0 - HofX(u_old,u_c))*(1.0 - v_old))/(tau_v2_minus*HofX(u_old,u_v) + tau_v1_minus*(1.0 - HofX(u_old,u_v)))) - ((HofX(u_old,u_c)*v_old)/(tau_v_plus));
           double RhsW = ( ((1.0 - HofX(u_old,u_c))*(1.0 - w_old))/(tau_w2_minus*HofX(u_old,u_w) + tau_w1_minus*(1.0 - HofX(u_old,u_w)))) - ((HofX(u_old,u_c)*w_old)/(tau_w_plus));
@@ -2621,73 +2741,78 @@ void SolverRecovery (EquationSystems & es, const GetPot &data, TimeData& datatim
           Rsystem.solution -> set(dof_indices2[s_var],s_new);
     
 
-    double freact = 0.0;
-    double Ifival = (-v_old*HofX(u_old,u_c)*(u_old-u_c)*(u_m-u_old)) / (tau_d);
-    double Isival = (-w_old*s_old) / (tau_si);
-    double Isoval = (((u_old-u_o)*(1.0 - HofX(u_old,u_so))) / tau_o) + HofX(u_old,u_so)*tau_a + .5*(a_so-tau_a)*(1.0 + tanh((u_old - b_so)/(c_so)));
+          double freact = 0.0;
+          double Ifival = (-v_old*HofX(u_old,u_c)*(u_old-u_c)*(u_m-u_old)) / (tau_d);
+          double Isival = (-w_old*s_old) / (tau_si);
+          double Isoval = (((u_old-u_o)*(1.0 - HofX(u_old,u_so))) / tau_o) + HofX(u_old,u_so)*tau_a + .5*(a_so-tau_a)*(1.0 + tanh((u_old - b_so)/(c_so)));
 
-    double Istim = 0.0;
-    double Istim2 = 0.0;
+          double Istim = 0.0;
+          double Istim2 = 0.0;
 
-    if( zDim == 0. ){
-        if(time < IstimD && time > stimulus_start_time && y > stimulus_miny && y < stimulus_maxy && x > stimulus_minx && x < stimulus_maxx){
-          Istim = IstimV;//with TIME < 1.2, -.08 is the minimum current stimulus to initiate AP propagation
+          if(SpiralBool == 0){
+                if( zDim == 0. ){
+                    if(time < IstimD && time > stimulus_start_time && y > stimulus_miny && y < stimulus_maxy && x > stimulus_minx && x < stimulus_maxx){
+                      Istim = IstimV;//with TIME < 1.2, -.08 is the minimum current stimulus to initiate AP propagation
+                      //libMesh::out << x << std::endl;
+                    }
+                }
+                else{
+                    if(time < IstimD && time > stimulus_start_time && y > stimulus_miny && y < stimulus_maxy && x > stimulus_minx && x < stimulus_maxx && z > stimulus_minz && z < stimulus_maxz){
+                      Istim = IstimV;//with TIME < 1.2, -.08 is the minimum current stimulus to initiate AP propagation
+                      //libMesh::out << x << std::endl;
+                    }
+                }
+                if(convergence_test){
+                  //freact = -kcubic*((u_old - u0)*(u_old - u1)*(u_old - u2));// - 1*r_new*(u_old-u0)) - Istim  - Istim2;
+                }
+                else{
+                    if(StimPlace.compare(0,13,"Transmembrane") == 0){
+                        freact = (-(Ifival + Isival + Isoval)) - Istim  - Istim2;
+                    }
+                    else{
+                        freact = (-(Ifival + Isival + Isoval));
+                    }
+                }
+            }
+
+            else if(SpiralBool == 1){
+                if(time < IstimD && x < 0. && y > 0.){
+                    Istim = IstimV;//with TIME < 1.2, -.08 is the minimum current stimulus to initiate AP propagation
+                //libMesh::out << Istim << std::endl;
+                }
+                freact = (-(Ifival + Isival + Isoval)) - Istim  - Istim2;
+            }
+
+            else if(SpiralBool == 2){
+                if(time < IstimD &&  y > tissue_maxy - 0.15 ){
+                    Istim = IstimV*1.;//with TIME < 1.2, -.08 is the minimum current stimulus to initiate AP propagation
+                    //libMesh::out << Istim << std::endl;
+                }
+                if(time < IstimD &&  x > tissue_maxx - 0.15 ){
+                    Istim = IstimV*1.;//with TIME < 1.2, -.08 is the minimum current stimulus to initiate AP propagation
+                    //libMesh::out << Istim << std::endl;
+                }
+                freact = (-(Ifival + Isival + Isoval)) - Istim  - Istim2;
+            }
+
+          //libMesh::out << freact << "    " << x << "    " << dof_indices[0] << std::endl;
           //libMesh::out << x << std::endl;
+
+
+          Bsystem.get_vector("In").set(dof_indices[u_var], freact);
+
+
+
         }
-    }
-    else{
-        if(time < IstimD && time > stimulus_start_time && y > stimulus_miny && y < stimulus_maxy && x > stimulus_minx && x < stimulus_maxx && z > stimulus_minz && z < stimulus_maxz){
-          Istim = IstimV;//with TIME < 1.2, -.08 is the minimum current stimulus to initiate AP propagation
-          //libMesh::out << x << std::endl;
-        }
-    }
-
-
-    /*
-    if(time > 8.5 && time < 10 && x > 1 && y > .5){
-      Istim2 = 0;//-3.5;
-    }
-    */
-
-    //freact = -8*(u_old*(u_old-1)*(u_old - 0.05)) - Istim - r_new*u_old - Istim2;
-    //freact = (-(Ifival + Isival + Isoval)) - Istim  - Istim2;
-
-    //u_old =
-    if(convergence_test){
-      //freact = -kcubic*((u_old - u0)*(u_old - u1)*(u_old - u2));// - 1*r_new*(u_old-u0)) - Istim  - Istim2;
-    }
-    else{
-        if(StimPlace.compare(0,13,"Transmembrane") == 0){
-            freact = (-(Ifival + Isival + Isoval)) - Istim  - Istim2;
-        }
-        else{
-            freact = (-(Ifival + Isival + Isoval));
-        }
-    }
-    //libMesh::out << freact << "    " << x << "    " << dof_indices[0] << std::endl;
-    //libMesh::out << x << std::endl;
-
-
-    Bsystem.get_vector("In").set(dof_indices[u_var], freact);
 
 
 
     }
-
-
-
-  }
-  Bsystem.get_vector("In").close();
-  //Rsystem.get_vector("Rvalues") = Rnew;
+    Bsystem.get_vector("In").close();
+    //Rsystem.get_vector("Rvalues") = Rnew;
   
     
   }
-
-
-
-  
-  
-
 
 
 
