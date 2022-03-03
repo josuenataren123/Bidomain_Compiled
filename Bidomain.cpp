@@ -459,6 +459,9 @@ int main(int argc, char **argv)
 
     // Create folde in which we save the output of the solution
     std::string output_folder = data("output_folder", "Output");
+    std::string stimulus_type = data("stimulus_type", "Transmembrane");
+    double IstimD = data("stimulus_duration",2.);
+
     struct stat out_dir;
     if (stat(&output_folder[0], &out_dir) != 0)
     {
@@ -545,6 +548,7 @@ int main(int argc, char **argv)
             parabolic_system.add_vector("FV"); // parabolic forcing term for exact solution
             parabolic_system.add_vector("aux1"); // auxilliary vector for assembling the RHS
             elliptic_system.add_vector("FVe"); // elliptic forcing term for exact solution
+            elliptic_system.add_vector("I_extra_stim"); // elliptic forcing term for exact solution
 
             recovery.add_variable("v", order, LAGRANGE, &tissue_subdomains);
             recovery.add_variable("w", order, LAGRANGE, &tissue_subdomains);
@@ -592,6 +596,7 @@ int main(int argc, char **argv)
             system.add_vector("F"); // forcing term for exact solution
             system.add_vector("aux1"); // auxilliary vector for assembling the RHS
             system.add_vector("ForcingConv");
+            system.add_vector("I_extra_stim");
 
             recovery.add_variable("v", order, LAGRANGE, &tissue_subdomains);
             recovery.add_variable("w", order, LAGRANGE, &tissue_subdomains);
@@ -687,6 +692,14 @@ int main(int argc, char **argv)
                 parabolic_system.update();
                 // Solve Elliptic
                 assemble_rhs(es, datatime, time_integrator, order, data, EquationType::ELLIPTIC);
+
+                if(stimulus_type.compare(0,13,"Extracellular") == 0){
+                    if(datatime.timestep*datatime.dt < IstimD){
+                        *elliptic_system.rhs += elliptic_system.get_vector("I_extra_stim");
+                        libMesh::out << "Extracellular stimulus happening..." << std::endl;
+                    }
+                }
+
                 elliptic_system.solve();
                 elliptic_system.update();
 
@@ -730,6 +743,14 @@ int main(int argc, char **argv)
                 if(datatime.timestep == 1) assemble_rhs(es, datatime, TimeIntegrator::SBDF1, order, data);
                 else if(datatime.timestep == 2) assemble_rhs(es, datatime, TimeIntegrator::SBDF2, order, data);
                 else assemble_rhs(es, datatime, time_integrator, order, data);
+
+                if(stimulus_type.compare(0,13,"Extracellular") == 0){
+                    if(datatime.timestep*datatime.dt < IstimD){
+                        *system.rhs += system.get_vector("I_extra_stim");
+                        libMesh::out << "Extracellular stimulus happening..." << std::endl;
+                    }
+                }
+
                 system.solve();
                 system.update();
                 break;
@@ -764,6 +785,14 @@ int main(int argc, char **argv)
                 //system.get_vector("ML").print();
                 //system.get_matrix("M").print();
                 //system.matrix->print();
+
+                if(stimulus_type.compare(0,13,"Extracellular") == 0){
+                    if(datatime.timestep*datatime.dt < IstimD){
+                        *system.rhs += system.get_vector("I_extra_stim");
+                        libMesh::out << "Extracellular stimulus happening..." << std::endl;
+                    }
+                }
+
                 system.solve();
                 //system.solution->print();
                 system.update();
@@ -789,6 +818,14 @@ int main(int argc, char **argv)
                 //solve_ionic_model_evaluate_ionic_currents(es, ionic_model, pacing, datatime, time_integrator);
                 SolverRecovery (es, data, datatime);
                 assemble_rhs(es, datatime, time_integrator, order, data);
+
+                if(stimulus_type.compare(0,13,"Extracellular") == 0){
+                    if(datatime.timestep*datatime.dt < IstimD){
+                        *system.rhs += system.get_vector("I_extra_stim");
+                        libMesh::out << "Extracellular stimulus happening..." << std::endl;
+                    }
+                }
+
                 system.solve();
                 system.update();
                 break;
@@ -1154,6 +1191,14 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
     double Cm = data("Cm", 1.5);
     double penalty = data("penalty", 1e8);
     double interface_penalty = data("interface_penalty", 1e4);
+    double zDim = data("nelz",0);
+    double stimulus_maxx = data("stimulus_maxx", .5);
+    double stimulus_minx = data("stimulus_minx", -.5);
+    double stimulus_maxy = data("stimulus_maxy", 1.5);
+    double stimulus_miny = data("stimulus_miny", 1.3);
+    double stimulus_maxz = data("stimulus_maxz", .05);
+    double stimulus_minz = data("stimulus_minz", -.05);
+    double IstimV = data("stimulus_amplitude", -1.);
 
     // setup tensors parameters
     // f0 \otimes f0
@@ -1170,6 +1215,7 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
     DenseMatrix < Number > K;
     DenseMatrix < Number > M;
     DenseVector < Number > M_lumped;
+    DenseVector < Number > I_extra_stim;
 
     std::vector < dof_id_type > dof_indices;
     std::vector < dof_id_type > parabolic_dof_indices;
@@ -1222,6 +1268,7 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
                 Kg.resize(parabolic_ndofs, parabolic_ndofs);
                 M.resize(parabolic_ndofs, parabolic_ndofs);
                 S.resize(parabolic_ndofs, parabolic_ndofs);
+                I_extra_stim.resize (elliptic_dof_indices.size());
                 M_lumped.resize(parabolic_ndofs);
 
                 auto subdomain_id = elem->subdomain_id();
@@ -1233,11 +1280,38 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
                 {
                     for (unsigned int qp = 0; qp < qrule.n_points(); qp++)
                     {
+                        const Real x = q_point[qp](0);
+                        const Real y = q_point[qp](1);
+                        const Real z = q_point[qp](2);
+                        
                         for (unsigned int i = 0; i != elliptic_ndofs; i++)
                         {
                             for (unsigned int j = 0; j != elliptic_ndofs; j++)
                             {
                                 K(i, j) += JxW[qp] * dphi[i][qp] * (sigma_b * dphi[j][qp]);
+
+
+
+                                if(zDim == 0){
+                                    if( y < stimulus_maxy && y > stimulus_miny && x > stimulus_minx && x < stimulus_maxx ){
+                                        //libMesh::out << "top boundary ->    x: " << x << ";      y: " << y << std::endl;
+                                        I_extra_stim(i) += JxW[qp]*(     phi[i][qp]*phi[j][qp]*((1./1.)*IstimV)     );
+                                    }
+                                    else{
+                                        I_extra_stim(i) += JxW[qp]*(0.);
+                                    }
+                                }
+                                else{
+                                    if( y < stimulus_maxy && y > stimulus_miny && x > stimulus_minx && x < stimulus_maxx && z > stimulus_minz && z < stimulus_maxz ){
+                                        //libMesh::out << "top boundary ->    x: " << x << ";      y: " << y << std::endl;
+                                        I_extra_stim(i) += JxW[qp]*(     phi[i][qp]*phi[j][qp]*((1./1.)*IstimV)     );
+                                    }
+                                    else{
+                                        I_extra_stim(i) += JxW[qp]*(0.);
+                                    }
+                                }
+
+
                             }
                         }
                     }
@@ -1335,9 +1409,11 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
                 parabolic_system.get_matrix("Ki").add_matrix(Ki, parabolic_dof_indices, parabolic_dof_indices);
                 parabolic_system.get_matrix("Ke").add_matrix(Ke, parabolic_dof_indices, parabolic_dof_indices);
                 parabolic_system.get_matrix("Kg").add_matrix(Kg, parabolic_dof_indices, parabolic_dof_indices);
+                elliptic_system.get_vector("I_extra_stim").add_vector(I_extra_stim, elliptic_dof_indices);
             }
             std::cout << "closing" << std::endl;
             elliptic_system.matrix->close();
+            elliptic_system.get_vector("I_extra_stim").close();
             parabolic_system.matrix->close();
             parabolic_system.get_matrix("M").close();
             parabolic_system.get_vector("ML").close();
@@ -1407,6 +1483,7 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
                 K.resize(ndofs, ndofs);
                 M.resize(ndofs, ndofs);
                 M_lumped.resize(ndofs);
+                I_extra_stim.resize (ndofs);
 
                 // reposition submatrices
                 // Reposition the submatrices...  The idea is this:
@@ -1430,11 +1507,38 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
                 {
                     for (unsigned int qp = 0; qp < qrule.n_points(); qp++)
                     {
+
+                        const Real x = q_point[qp](0);
+                        const Real y = q_point[qp](1);
+                        const Real z = q_point[qp](2);
+
                         for (unsigned int i = 0; i != elliptic_ndofs; i++)
                         {
                             for (unsigned int j = 0; j != elliptic_ndofs; j++)
                             {
                                 K(i, j) += JxW[qp] * dphi[i][qp] * (sigma_b * dphi[j][qp]);
+
+
+                                if(zDim == 0){
+                                    if( y < stimulus_maxy && y > stimulus_miny && x > stimulus_minx && x < stimulus_maxx ){
+                                        //libMesh::out << "top boundary ->    x: " << x << ";      y: " << y << std::endl;
+                                        I_extra_stim(i) += JxW[qp]*(     phi[i][qp]*phi[j][qp]*((1./1.)*IstimV)     );
+                                    }
+                                    else{
+                                        I_extra_stim(i) += JxW[qp]*(0.);
+                                    }
+                                }
+                                else{
+                                    if( y < stimulus_maxy && y > stimulus_miny && x > stimulus_minx && x < stimulus_maxx && z > stimulus_minz && z < stimulus_maxz ){
+                                        //libMesh::out << "top boundary ->    x: " << x << ";      y: " << y << std::endl;
+                                        I_extra_stim(i) += JxW[qp]*(     phi[i][qp]*phi[j][qp]*((1./1.)*IstimV)     );
+                                    }
+                                    else{
+                                        I_extra_stim(i) += JxW[qp]*(0.);
+                                    }
+                                }
+
+
                             }
                         }
                     }
@@ -1496,10 +1600,12 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
                 system.matrix->add_matrix (K, dof_indices, dof_indices);
                 system.get_matrix("M").add_matrix(M, dof_indices, dof_indices);
                 system.get_vector("ML").add_vector(M_lumped, dof_indices);
+                system.get_vector("I_extra_stim").add_vector(I_extra_stim, dof_indices);
             }
             system.matrix->close();
             system.get_matrix("M").close();
             system.get_vector("ML").close();
+            system.get_vector("I_extra_stim").close();
             break;
         }
     }
