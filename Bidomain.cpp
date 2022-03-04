@@ -1283,7 +1283,7 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
                         const Real x = q_point[qp](0);
                         const Real y = q_point[qp](1);
                         const Real z = q_point[qp](2);
-                        
+
                         for (unsigned int i = 0; i != elliptic_ndofs; i++)
                         {
                             for (unsigned int j = 0; j != elliptic_ndofs; j++)
@@ -2386,7 +2386,11 @@ void SolverRecovery (EquationSystems & es, const GetPot &data, TimeData& datatim
   double IstimD = data("stimulus_duration", 2.);
   double IstimV = data("stimulus_amplitude", -1.);
   double tissue_maxx = data("tissue_maxx", .5);
+  double tissue_minx = data("tissue_minx", .5);
   double tissue_maxy = data("tissue_maxy", .5);
+  double tissue_miny = data("tissue_miny", .5);
+  double tissue_maxz = data("tissue_maxz", .5);
+  double tissue_minz = data("tissue_minz", .5);
   double stimulus_maxx = data("stimulus_maxx", .5);
   double stimulus_maxy = data("stimulus_maxy", .5);
   double stimulus_minx = data("stimulus_minx", -.5);
@@ -2722,7 +2726,7 @@ void SolverRecovery (EquationSystems & es, const GetPot &data, TimeData& datatim
             }
 
             else if(SpiralBool == 2){
-                if(time < IstimD &&  y > tissue_maxy - 0.15 ){
+                if(time < IstimD &&  x < tissue_minx + 0.5 && y > 0. ){
                     Istim = IstimV*1.;//with TIME < 1.2, -.08 is the minimum current stimulus to initiate AP propagation
                     //libMesh::out << Istim << std::endl;
                 }
@@ -2730,6 +2734,12 @@ void SolverRecovery (EquationSystems & es, const GetPot &data, TimeData& datatim
                     Istim = IstimV*1.;//with TIME < 1.2, -.08 is the minimum current stimulus to initiate AP propagation
                     //libMesh::out << Istim << std::endl;
                 }
+                //SECOND STIMULUS
+                //if(time > 150. && time < 152. &&  x > tissue_maxx - 0.15 && y < 0. ){
+                    //Istim = IstimV*.5;//with TIME < 1.2, -.08 is the minimum current stimulus to initiate AP propagation
+                    //libMesh::out << Istim << std::endl;
+                //}
+
                 freact = (-(Ifival + Isival + Isoval)) - Istim  - Istim2;
             }
 
@@ -2890,7 +2900,7 @@ void SolverRecovery (EquationSystems & es, const GetPot &data, TimeData& datatim
             }
 
             else if(SpiralBool == 2){
-                if(time < IstimD &&  y > tissue_maxy - 0.15 ){
+                if(time < IstimD &&  x < tissue_minx + 0.5 && y > 0. ){
                     Istim = IstimV*1.;//with TIME < 1.2, -.08 is the minimum current stimulus to initiate AP propagation
                     //libMesh::out << Istim << std::endl;
                 }
@@ -2898,6 +2908,12 @@ void SolverRecovery (EquationSystems & es, const GetPot &data, TimeData& datatim
                     Istim = IstimV*1.;//with TIME < 1.2, -.08 is the minimum current stimulus to initiate AP propagation
                     //libMesh::out << Istim << std::endl;
                 }
+                //SECOND STIMULUS
+                //if(time > 150. && time < 152. &&  x > tissue_maxx - 0.15 && y < 0. ){
+                    //Istim = IstimV*.5;//with TIME < 1.2, -.08 is the minimum current stimulus to initiate AP propagation
+                    //libMesh::out << Istim << std::endl;
+                //}
+
                 freact = (-(Ifival + Isival + Isoval)) - Istim  - Istim2;
             }
 
