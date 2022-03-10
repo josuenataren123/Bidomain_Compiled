@@ -25,6 +25,7 @@
  along with this program.  If not, see <http://www.gnu.org/licenses/>.
  ============================================================================
  */
+#include <chrono>
 
 #include "libmesh/exodusII_io.h"
 #include "libmesh/mesh_generation.h"
@@ -52,6 +53,9 @@
 
 #include "libmesh/vtk_io.h"
 #include <iomanip>      // std::setw
+
+
+
 
 using namespace libMesh;
 
@@ -199,9 +203,9 @@ void assemble_rhs(  libMesh::EquationSystems &es,
 void assemble_forcing_and_eval_error(libMesh::EquationSystems &es, const TimeData &timedata, TimeIntegrator time_integrator, libMesh::Order p_order, const GetPot &data, IonicModel& ionic_model, std::vector<double>& error );
 
 
-void ForcingTermConvergence(libMesh::EquationSystems &es, const double dt, const double Beta, const double Cm, const double SigmaSI, const double SigmaSE, const double SigmaBath, const double CurTime, const double xDim, const double v0, const double v1, const double v2, const double kcubic );
+void ForcingTermConvergence(libMesh::EquationSystems &es, const double dt, const double Beta, const double Cm, const double SigmaSI, const double SigmaSE, const double SigmaBath, const double CurTime, const double xDim, const double v0, const double v1, const double v2, const double kcubic, const std::string integrator );
 
-void init_cd_exact (EquationSystems & es, const double xDim);
+void init_cd_exact (EquationSystems & es, const double xDim, std::string integrator);
 
 void SolverRecovery (EquationSystems & es, const GetPot &data, TimeData& datatime);
 
@@ -445,9 +449,13 @@ double HofX(double uvalue, double otherValue){
 
 
 
+using namespace std;
 
 int main(int argc, char **argv)
 {
+
+
+
     // Read input file
     GetPot cl(argc, argv);
     std::string datafile_name = cl.follow("data.beat", 2, "-i", "--input");
@@ -457,10 +465,15 @@ int main(int argc, char **argv)
     // Initialize libMesh
     LibMeshInit init(argc, argv, MPI_COMM_WORLD);
 
+    chrono::steady_clock sc;   // create an object of `steady_clock` class
+    auto start = sc.now();     // start timer
+
     // Create folde in which we save the output of the solution
     std::string output_folder = data("output_folder", "Output");
     std::string stimulus_type = data("stimulus_type", "Transmembrane");
     double IstimD = data("stimulus_duration",2.);
+
+    bool convergence_test_save = data("convergence_test_save", false);
 
     struct stat out_dir;
     if (stat(&output_folder[0], &out_dir) != 0)
@@ -537,6 +550,12 @@ int main(int argc, char **argv)
 
             std::cout << "Using element of order p = " << order << std::endl;
 
+            if(convergence_test_save){
+				LinearImplicitSystem & solutionSystem = es.add_system <LinearImplicitSystem> ("Solution");
+				solutionSystem.add_variable("Ve_exact", order, LAGRANGE);
+				solutionSystem.add_variable("V_exact",order, LAGRANGE, &tissue_subdomains);
+			}
+
             parabolic_system.add_variable("V", order, LAGRANGE, &tissue_subdomains);
             elliptic_system.add_variable("Ve", order, LAGRANGE);
             parabolic_system.add_matrix("Ki");
@@ -547,8 +566,10 @@ int main(int argc, char **argv)
             parabolic_system.add_vector("In");
             parabolic_system.add_vector("FV"); // parabolic forcing term for exact solution
             parabolic_system.add_vector("aux1"); // auxilliary vector for assembling the RHS
+            parabolic_system.add_vector("ForcingV");
             elliptic_system.add_vector("FVe"); // elliptic forcing term for exact solution
             elliptic_system.add_vector("I_extra_stim"); // elliptic forcing term for exact solution
+            elliptic_system.add_vector("ForcingVe");
 
             recovery.add_variable("v", order, LAGRANGE, &tissue_subdomains);
             recovery.add_variable("w", order, LAGRANGE, &tissue_subdomains);
@@ -556,13 +577,7 @@ int main(int argc, char **argv)
             
 
             es.init();
-            if(convergence_test)
-            {
-                libMesh::AnalyticFunction<libMesh::Number> ic_V(exact_solution_V);
-                libMesh::AnalyticFunction<libMesh::Number> ic_Ve_Vb(exact_solution_Ve_Vb);
-                parabolic_system.project_solution(&ic_V);
-                elliptic_system.project_solution(&ic_Ve_Vb);
-            }
+
 
             break;
         }
@@ -577,7 +592,7 @@ int main(int argc, char **argv)
             
             TransientExplicitSystem & recovery = es.add_system <TransientExplicitSystem> ("Recovery");
 
-            if(convergence_test){
+            if(convergence_test_save){
                 LinearImplicitSystem & solutionSystem = es.add_system <LinearImplicitSystem> ("Solution");
                 solutionSystem.add_variable("Ve_exact", order, LAGRANGE);
                 solutionSystem.add_variable("V_exact",order, LAGRANGE, &tissue_subdomains);
@@ -610,11 +625,7 @@ int main(int argc, char **argv)
 
             es.init();
 
-            if(convergence_test)
-            {
-                //libMesh::AnalyticFunction<libMesh::Number> ic(exact_solution_monolithic);
-                //system.project_solution(&ic);
-            }
+
 
             break;
         }
@@ -651,10 +662,7 @@ int main(int argc, char **argv)
 
     for (; datatime.time < datatime.end_time; )
     {
-        if(convergence_test)
-        {
-            //assemble_forcing_and_eval_error(es, datatime, time_integrator, order, data, ionic_model, error);
-        }
+
         // advance time
         datatime.time += datatime.dt;
         datatime.timestep++;
@@ -671,6 +679,9 @@ int main(int argc, char **argv)
                 if(datatime.timestep == 1)
                 {
                     assemble_matrices(es, datatime, time_integrator, order, data);
+                    if(convergence_test){
+					   init_cd_exact(es, xDim, integrator);
+				   }
                 }
                 libMesh::LinearImplicitSystem &elliptic_system = es.get_system < libMesh::LinearImplicitSystem > ("elliptic");
                 libMesh::TransientLinearImplicitSystem & parabolic_system = es.get_system < libMesh::TransientLinearImplicitSystem > ("parabolic");
@@ -707,6 +718,7 @@ int main(int argc, char **argv)
                 {
                      // Solve Parabolic
                      assemble_rhs(es, datatime, time_integrator, order, data, EquationType::PARABOLIC);
+                     *parabolic_system.rhs -= parabolic_system.get_vector("ForcingV");
                      parabolic_system.solve();
                      parabolic_system.update();
                 }
@@ -718,7 +730,7 @@ int main(int argc, char **argv)
                 {
                     assemble_matrices(es, datatime, TimeIntegrator::SBDF1, order, data);
                     if(convergence_test){
-                        init_cd_exact(es, xDim);
+                        init_cd_exact(es, xDim, integrator);
                     }
                 }
                 if(datatime.timestep == 2)
@@ -761,7 +773,7 @@ int main(int argc, char **argv)
                 {
                     assemble_matrices(es, datatime, TimeIntegrator::SBDF1, order, data);
                     if(convergence_test){
-                        init_cd_exact(es, xDim);
+                        init_cd_exact(es, xDim, integrator);
                     }
                 }
                 if(datatime.timestep == 2)
@@ -804,7 +816,7 @@ int main(int argc, char **argv)
                 if(datatime.timestep == 1){
                     assemble_matrices(es, datatime, time_integrator, order, data);
                     if(convergence_test){
-                        init_cd_exact(es, xDim);
+                        init_cd_exact(es, xDim, integrator);
                     }
                 }
 
@@ -846,135 +858,153 @@ int main(int argc, char **argv)
             std::cout << "done " << std::endl;
         }
 
+        if (0 == datatime.timestep % 20)
+		{
+			std::cout << "At time: " << datatime.time << " ms: " << std::flush;
+			std::cout << "done " << std::endl;
+		}
+
 
 
 
      //START OF ERROR CALCULATION
-      if(convergence_test && (time_integrator == TimeIntegrator::SBDF1 || time_integrator == TimeIntegrator::SBDF2 || time_integrator == TimeIntegrator::SBDF3) ){
+      if(convergence_test){
 
           double totalErrorInSpaceV = 0.;
           double totalErrorInSpaceVe = 0.;
           double totalErrorInSpaceVb = 0.;
-
-          libMesh::LinearImplicitSystem &solutionSystem = es.get_system < libMesh::LinearImplicitSystem > ("Solution");
-
-          auto femSolu = es.get_system("bidomain").variable_number("V");
-          auto femSolu2 = es.get_system("bidomain").variable_number("Ve");
-          auto femSoluV_exact = es.get_system("Solution").variable_number("V_exact");
-          auto femSoluVe_exact = es.get_system("Solution").variable_number("Ve_exact");
-
-
-          const unsigned int dim = mesh.mesh_dimension();
-
-          const DofMap & dof_map = es.get_system("Solution").get_dof_map();
-          const DofMap & dof_map2 = es.get_system("Recovery").get_dof_map();
-
-          FEType fe_type = dof_map.variable_type(femSolu);
-          std::unique_ptr<FEBase> fe (FEBase::build(dim, fe_type));
-
-          QGauss qrule (dim, TENTH);
-
-          // Tell the finite element object to use our quadrature rule.
-          fe->attach_quadrature_rule (&qrule);
-
-          const std::vector<Point> & q_point = fe->get_xyz();
-          const std::vector<Real> & JxW = fe->get_JxW();
-          const std::vector<std::vector<Real>> & phi = fe->get_phi();
-
-          int rowsn = 0;
-          int colsn = 0;
-
           double u_h, u_exact, ue_h, ue_exact, ub_h, ub_exact;
-
+          const unsigned int dim = mesh.mesh_dimension();
+          const DofMap & dof_map2 = es.get_system("Recovery").get_dof_map();
           std::vector<dof_id_type> dof_indices;
           std::vector<dof_id_type> dof_indices2;
-
-
-          for(const auto & node : mesh.local_node_ptr_range()){
-
-            dof_map.dof_indices (node, dof_indices);
-            dof_map2.dof_indices (node, dof_indices2);
-
-            const Real x = (*node)(0);
-            const Real y = (*node)(1);
-
-            if(dof_indices2.size() > 0){
-
-            u_exact = exact_solutionV_all(x, y, 2, datatime.time, 0.0, xDim);
-            solutionSystem.solution -> set(dof_indices[femSoluV_exact],u_exact);
-            ue_exact = exact_solutionV_all(x, y, 3, datatime.time, 0.0, xDim);
-            solutionSystem.solution -> set(dof_indices[femSoluVe_exact],ue_exact);
-
-            }
-            else{
-            ue_exact = exact_solutionV_all(x, y, 4, datatime.time, 0.0, xDim);
-            solutionSystem.solution -> set(dof_indices[femSoluVe_exact],ue_exact);
-            }
+          std::vector<dof_id_type> dof_indices3;
 
 
 
-            //libMesh::out << "x: " << x << "      dof: " << dof_indices[femSoluVe_exact] << "    ue= " << ue_exact << std::endl;
-            //totalErrorInSpaceV += 1*((u_h - u_exact)*(u_h - u_exact));
-            //totalErrorInSpaceVe += 1*((ue_h - ue_exact)*(ue_h - ue_exact));
+          if( time_integrator == TimeIntegrator::SBDF1 || time_integrator == TimeIntegrator::SBDF2 || time_integrator == TimeIntegrator::SBDF3 )
+          {
+			  auto femSolu = es.get_system("bidomain").variable_number("V");
+			  auto femSolu2 = es.get_system("bidomain").variable_number("Ve");
+			  FEType fe_type = dof_map2.variable_type(femSolu);
+			  std::unique_ptr<FEBase> fe (FEBase::build(dim, fe_type));
+			  QGauss qrule (dim, FIFTH);
+			  // Tell the finite element object to use our quadrature rule.
+			  fe->attach_quadrature_rule (&qrule);
+			  const std::vector<Point> & q_point = fe->get_xyz();
+			  const std::vector<Real> & JxW = fe->get_JxW();
+			  const std::vector<std::vector<Real>> & phi = fe->get_phi();
 
-          }
+			  for(const auto & elem : mesh.active_local_element_ptr_range()){
 
+			  fe->reinit (elem);
 
+			  for (unsigned int qp=0; qp<qrule.n_points(); qp++){
 
+					if(elem -> subdomain_id() == 1){
+					  u_h = es.get_system("bidomain").point_value(femSolu, q_point[qp], elem);
+					  u_exact = exact_solutionV_all(q_point[qp](0), q_point[qp](1), 2, datatime.time, 0.0, xDim);
+					  ue_h = es.get_system("bidomain").point_value(femSolu2, q_point[qp], elem);
+					  ue_exact = exact_solutionV_all(q_point[qp](0),q_point[qp](1), 3, datatime.time, 0.0, xDim);
+					  ub_h = 0.;
+					  ub_exact = 0.;
 
+					  //equation_systems.get_system("Bidomain").point_value(femSoluV_exact, q_point[qp], elem) = u_exact;
+					  //equation_systems.get_system("Bidomain").point_value(femSoluVe_exact, q_point[qp], elem) = ue_exact;
 
+					}
+					else{
+					  u_h = 0.;
+					  u_exact = 0.;
+					  ue_h = 0.;
+					  ue_exact = 0.;
+					  ub_h = es.get_system("bidomain").point_value(femSolu2, q_point[qp], elem);
+					  ub_exact = exact_solutionV_all(q_point[qp](0),q_point[qp](1), 4, datatime.time, 0.0, xDim);
 
-
-          for(const auto & elem : mesh.active_local_element_ptr_range()){
-
-          fe->reinit (elem);
-
-          for (unsigned int qp=0; qp<qrule.n_points(); qp++){
-
-            if(elem -> subdomain_id() == 1){
-              u_h = es.get_system("bidomain").point_value(femSolu, q_point[qp], elem);
-              u_exact = exact_solutionV_all(q_point[qp](0), q_point[qp](1), 2, datatime.time, 0.0, xDim);
-              ue_h = es.get_system("bidomain").point_value(femSolu2, q_point[qp], elem);
-              ue_exact = exact_solutionV_all(q_point[qp](0),q_point[qp](1), 3, datatime.time, 0.0, xDim);
-              ub_h = 0.;
-              ub_exact = 0.;
-
-              //equation_systems.get_system("Bidomain").point_value(femSoluV_exact, q_point[qp], elem) = u_exact;
-              //equation_systems.get_system("Bidomain").point_value(femSoluVe_exact, q_point[qp], elem) = ue_exact;
-
-            }
-            else{
-              u_h = 0.;
-              u_exact = 0.;
-              ue_h = 0.;
-              ue_exact = 0.;
-              ub_h = es.get_system("bidomain").point_value(femSolu2, q_point[qp], elem);
-              ub_exact = exact_solutionV_all(q_point[qp](0),q_point[qp](1), 4, datatime.time, 0.0, xDim);
-
-              //equation_systems.get_system("Bidomain").point_value(femSoluVe_exact, q_point[qp], elem) = ue_exact;
-            }
-
-
-            totalErrorInSpaceV += JxW[qp]*((u_h - u_exact)*(u_h - u_exact));
-            totalErrorInSpaceVe += JxW[qp]*((ue_h - ue_exact)*(ue_h - ue_exact));
-            totalErrorInSpaceVb += JxW[qp]*((ub_h - ub_exact)*(ub_h - ub_exact));
-            //rowsn = double(elem);
-            //colsn = qp;
-            //cout << qp << '\n';
-
-            //if(qp == 0){
-              //rowsn = rowsn + 1;
-              //cout << 'this is rows: ' << rowsn << '\n';
-            //}
-
-            //cout << 'element: ' << elem << ' with qp: ' << q_point[qp] << endl;
-            //cout << typeof(elem).name() << endl;
-          }
-
-      }
+					  //equation_systems.get_system("Bidomain").point_value(femSoluVe_exact, q_point[qp], elem) = ue_exact;
+					}
 
 
-      //cout << rowsn << " and " << colsn+1 << '\n';
+					totalErrorInSpaceV += JxW[qp]*((u_h - u_exact)*(u_h - u_exact));
+					totalErrorInSpaceVe += JxW[qp]*((ue_h - ue_exact)*(ue_h - ue_exact));
+					totalErrorInSpaceVb += JxW[qp]*((ub_h - ub_exact)*(ub_h - ub_exact));
+					//rowsn = double(elem);
+					//colsn = qp;
+					//cout << qp << '\n';
+
+					//if(qp == 0){
+					  //rowsn = rowsn + 1;
+					  //cout << 'this is rows: ' << rowsn << '\n';
+					//}
+
+					//cout << 'element: ' << elem << ' with qp: ' << q_point[qp] << endl;
+					//cout << typeof(elem).name() << endl;
+				  }
+
+			  }
+           }
+          else{
+			  auto femSolu = es.get_system("parabolic").variable_number("V");
+			  auto femSolu2 = es.get_system("elliptic").variable_number("Ve");
+			  FEType fe_type = dof_map2.variable_type(femSolu);
+			  std::unique_ptr<FEBase> fe (FEBase::build(dim, fe_type));
+			  QGauss qrule (dim, FIFTH);
+			  // Tell the finite element object to use our quadrature rule.
+			  fe->attach_quadrature_rule (&qrule);
+			  const std::vector<Point> & q_point = fe->get_xyz();
+			  const std::vector<Real> & JxW = fe->get_JxW();
+			  const std::vector<std::vector<Real>> & phi = fe->get_phi();
+
+			  for(const auto & elem : mesh.active_local_element_ptr_range()){
+
+			  fe->reinit (elem);
+
+			  for (unsigned int qp=0; qp<qrule.n_points(); qp++){
+
+					if(elem -> subdomain_id() == 1){
+					  u_h = es.get_system("parabolic").point_value(femSolu, q_point[qp], elem);
+					  u_exact = exact_solutionV_all(q_point[qp](0), q_point[qp](1), 2, datatime.time, 0.0, xDim);
+					  ue_h = es.get_system("elliptic").point_value(femSolu2, q_point[qp], elem);
+					  ue_exact = exact_solutionV_all(q_point[qp](0),q_point[qp](1), 3, datatime.time, 0.0, xDim);
+					  ub_h = 0.;
+					  ub_exact = 0.;
+
+					  //equation_systems.get_system("Bidomain").point_value(femSoluV_exact, q_point[qp], elem) = u_exact;
+					  //equation_systems.get_system("Bidomain").point_value(femSoluVe_exact, q_point[qp], elem) = ue_exact;
+
+					}
+					else{
+					  u_h = 0.;
+					  u_exact = 0.;
+					  ue_h = 0.;
+					  ue_exact = 0.;
+					  ub_h = es.get_system("elliptic").point_value(femSolu2, q_point[qp], elem);
+					  ub_exact = exact_solutionV_all(q_point[qp](0),q_point[qp](1), 4, datatime.time, 0.0, xDim);
+
+					  //equation_systems.get_system("Bidomain").point_value(femSoluVe_exact, q_point[qp], elem) = ue_exact;
+					}
+
+
+					totalErrorInSpaceV += JxW[qp]*((u_h - u_exact)*(u_h - u_exact));
+					totalErrorInSpaceVe += JxW[qp]*((ue_h - ue_exact)*(ue_h - ue_exact));
+					totalErrorInSpaceVb += JxW[qp]*((ub_h - ub_exact)*(ub_h - ub_exact));
+					//rowsn = double(elem);
+					//colsn = qp;
+					//cout << qp << '\n';
+
+					//if(qp == 0){
+					  //rowsn = rowsn + 1;
+					  //cout << 'this is rows: ' << rowsn << '\n';
+					//}
+
+					//cout << 'element: ' << elem << ' with qp: ' << q_point[qp] << endl;
+					//cout << typeof(elem).name() << endl;
+				  }
+
+			  }
+           }
+
+
 
       totalErrorInSpaceTimeV += datatime.dt*std::sqrt(totalErrorInSpaceV);
       totalErrorInSpaceTimeVe += datatime.dt*std::sqrt(totalErrorInSpaceVe);
@@ -983,6 +1013,38 @@ int main(int argc, char **argv)
       libMesh::out << "The L2 norm for V in space is: " << std::sqrt(totalErrorInSpaceV)<< std::endl;
       libMesh::out << "The L2 norm for Ve in space is: " << std::sqrt(totalErrorInSpaceVe)<< std::endl;
       libMesh::out << "The L2 norm for Vb in space is: " << std::sqrt(totalErrorInSpaceVb)<< std::endl;
+
+      //START OF SAVING SOLUTION SYSTEM
+		if(convergence_test_save){
+		  auto femSoluV_exact = es.get_system("Solution").variable_number("V_exact");
+		  auto femSoluVe_exact = es.get_system("Solution").variable_number("Ve_exact");
+
+		  const DofMap & dof_map = es.get_system("Solution").get_dof_map();
+
+		  for(const auto & node : mesh.local_node_ptr_range()){
+
+			dof_map.dof_indices (node, dof_indices);
+			dof_map2.dof_indices (node, dof_indices2);
+
+			const Real x = (*node)(0);
+			const Real y = (*node)(1);
+
+			if(dof_indices2.size() > 0){
+
+			u_exact = exact_solutionV_all(x, y, 2, datatime.time, 0.0, xDim);
+			es.get_system("Solution").solution -> set(dof_indices[femSoluV_exact],u_exact);
+			ue_exact = exact_solutionV_all(x, y, 3, datatime.time, 0.0, xDim);
+			es.get_system("Solution").solution -> set(dof_indices[femSoluVe_exact],ue_exact);
+
+			}
+			else{
+			ue_exact = exact_solutionV_all(x, y, 4, datatime.time, 0.0, xDim);
+			es.get_system("Solution").solution -> set(dof_indices[femSoluVe_exact],ue_exact);
+			}
+
+		  }
+		}
+		//END OF SAVING SOLUTION SYSTEM
 
     }
     //END OF ERROR CALCULATION
@@ -993,19 +1055,12 @@ int main(int argc, char **argv)
 
     }
 
+    auto end = sc.now();       // end timer (starting & ending is done by measuring the time at the moment the process started & ended respectively)
+    auto time_span = static_cast<chrono::duration<double>>(end - start);   // measure time span between start & end
+    cout<<"Operation took: "<<time_span.count()<<" seconds"<<std::endl;
 
     if(convergence_test)
     {
-        //assemble_forcing_and_eval_error(es, datatime, time_integrator, order, data, ionic_model, error);
-        //std::cout << "Error V: " << error[0] << std::endl;
-        //std::cout << "Error Ve: " << error[1] << std::endl;
-        //std::cout << "Error Vb: " << error[2] << std::endl;
-
-
-
-
-
-
         libMesh::out << "The L2 norm for V in space AND time is: " << (totalErrorInSpaceTimeV)<< std::endl;
         libMesh::out << "The L2 norm for Ve in space AND time is: " << (totalErrorInSpaceTimeVe)<< std::endl;
         libMesh::out << "The L2 norm for Vb in space AND time is: " << (totalErrorInSpaceTimeVb)<< std::endl;
@@ -1020,11 +1075,8 @@ int main(int argc, char **argv)
         outputFile << "The L2 norm for V in space AND time is: " << (totalErrorInSpaceTimeV)<< std::endl;
         outputFile << "The L2 norm for Ve in space AND time is: " << (totalErrorInSpaceTimeVe)<< std::endl;
         outputFile << "The L2 norm for Vb in space AND time is: " << (totalErrorInSpaceTimeVb)<< std::endl;
-        //outputFile << "Operation took: "<<time_span.count()<<" seconds"<<std::endl;
+        outputFile << "Operation took: "<<time_span.count()<<" seconds"<<std::endl;
         outputFile.close();
-
-
-
     }
 
     return 0;
@@ -1945,6 +1997,7 @@ void assemble_rhs(  libMesh::EquationSystems &es,
     double v1 = data("v1", 0.05);
     double v2 = data("v2", 1.);
     double kcubic = data("k", 8.);
+    std::string integrator = data("integrator","SBDF1");
     //std::cout << " assemble_rhs " << std::endl;
     switch (time_integrator)
     {
@@ -1960,6 +2013,12 @@ void assemble_rhs(  libMesh::EquationSystems &es,
             const DofMap & parabolic_dof_map = parabolic_system.get_dof_map();
             std::vector < dof_id_type > parabolic_dof_indices;
             std::vector < dof_id_type > elliptic_dof_indices;
+
+            if(convergence_test){
+            	parabolic_system.get_vector("ForcingV").zero();
+            	elliptic_system.get_vector("ForcingVe").zero();
+				ForcingTermConvergence ( es, timedata.dt, chi, Cm, sigma_s_i, sigma_s_e, sigma_b_ie, timedata.time, xDim, v0, v1, v2, kcubic, integrator);
+			}
 
             if(type == EquationType::PARABOLIC)
             {
@@ -2006,7 +2065,10 @@ void assemble_rhs(  libMesh::EquationSystems &es,
                 parabolic_system.get_vector("aux1").add(1.0, parabolic_system.get_vector("In"));
                 // add  M * In
                 parabolic_system.rhs->add_vector(parabolic_system.get_vector("aux1"), parabolic_system.get_matrix("M"));
-                parabolic_system.rhs->add(parabolic_system.get_vector("FV"));
+
+                if(convergence_test){
+                	parabolic_system.rhs->add(parabolic_system.get_vector("ForcingV"));
+                }
 
                 if(time_integrator == TimeIntegrator::SEMI_IMPLICIT ||
                    time_integrator == TimeIntegrator::SEMI_IMPLICIT_HALF_STEP)
@@ -2042,7 +2104,10 @@ void assemble_rhs(  libMesh::EquationSystems &es,
                         elliptic_system.rhs->set(elliptic_dof_indices[0], -KiV);
                     }
                 }
-                elliptic_system.rhs->add(elliptic_system.get_vector("FVe"));
+
+                if(convergence_test){
+                	elliptic_system.rhs->add(elliptic_system.get_vector("ForcingVe"));
+                }
 
             }
             break;
@@ -2085,7 +2150,7 @@ void assemble_rhs(  libMesh::EquationSystems &es,
             // add forcing
             if(convergence_test){
                 system.get_vector("ForcingConv").zero();
-                ForcingTermConvergence ( es, timedata.dt, chi, Cm, sigma_s_i, sigma_s_e, sigma_b_ie, timedata.time, xDim, v0, v1, v2, kcubic);
+                ForcingTermConvergence ( es, timedata.dt, chi, Cm, sigma_s_i, sigma_s_e, sigma_b_ie, timedata.time, xDim, v0, v1, v2, kcubic, integrator);
                 system.rhs->add(system.get_vector("ForcingConv"));
             }
             //system.rhs->add(system.get_vector("F"));
@@ -2130,7 +2195,7 @@ void assemble_rhs(  libMesh::EquationSystems &es,
             // add forcing
             if(convergence_test){
                 system.get_vector("ForcingConv").zero();
-                ForcingTermConvergence ( es, timedata.dt, chi, Cm, sigma_s_i, sigma_s_e, sigma_b_ie, timedata.time, xDim, v0, v1, v2, kcubic);
+                ForcingTermConvergence ( es, timedata.dt, chi, Cm, sigma_s_i, sigma_s_e, sigma_b_ie, timedata.time, xDim, v0, v1, v2, kcubic, integrator);
                 system.rhs->add(system.get_vector("ForcingConv"));
             }
             //system.rhs->add(system.get_vector("F"));
@@ -2167,7 +2232,7 @@ void assemble_rhs(  libMesh::EquationSystems &es,
             // add forcing
             if(convergence_test){
                 system.get_vector("ForcingConv").zero();
-                ForcingTermConvergence ( es, timedata.dt, chi, Cm, sigma_s_i, sigma_s_e, sigma_b_ie, timedata.time, xDim, v0, v1, v2, kcubic);
+                ForcingTermConvergence ( es, timedata.dt, chi, Cm, sigma_s_i, sigma_s_e, sigma_b_ie, timedata.time, xDim, v0, v1, v2, kcubic, integrator);
                 system.rhs->add(system.get_vector("ForcingConv"));
             }
             //system.rhs->add(system.get_vector("F"));
@@ -2879,8 +2944,8 @@ void SolverRecovery (EquationSystems & es, const GetPot &data, TimeData& datatim
                     }
                 }
                 if(convergence_test){
-                  //freact = -kcubic*((u_old - u0)*(u_old - u1)*(u_old - u2));// - 1*r_new*(u_old-u0)) - Istim  - Istim2;
-                }
+				  freact = -kcubic*((u_old - u0)*(u_old - u1)*(u_old - u2));// - 1*r_new*(u_old-u0)) - Istim  - Istim2;
+				}
                 else{
                     if(StimPlace.compare(0,13,"Transmembrane") == 0){
                         freact = (-(Ifival + Isival + Isoval)) - Istim  - Istim2;
@@ -2947,428 +3012,360 @@ void SolverRecovery (EquationSystems & es, const GetPot &data, TimeData& datatim
 
 
 
-void init_cd_exact (EquationSystems & es, const double xDim)
+void init_cd_exact (EquationSystems & es, const double xDim, std::string integrator)
 {
-    TransientLinearImplicitSystem & Bsystem = es.get_system <TransientLinearImplicitSystem> ("bidomain");
-    //LinearImplicitSystem & Bsystem2 = es.get_system <LinearImplicitSystem> ("BidomainCheck");
-    //LinearImplicitSystem & Psystem = es.get_system <LinearImplicitSystem> ("Parabolic");
-    Bsystem.update();
-    //Psystem.update();
 
-    MeshBase & mesh = es.get_mesh();
-
-
-      auto femSolu = es.get_system("bidomain").variable_number("V");
-      auto femSolu2 = es.get_system("bidomain").variable_number("Ve");
+	  MeshBase & mesh = es.get_mesh();
+	  const DofMap & dof_map2 = es.get_system("Recovery").get_dof_map();
+	  const unsigned int dim = mesh.mesh_dimension();
+	  QGauss qrule (dim, FIFTH);
+	  double u_h, u_exact, ue_h, ue_exact;
+	  std::vector<dof_id_type> dof_indices;
+	  std::vector<dof_id_type> dof_indices2;
+	  std::vector<dof_id_type> dof_indicesP;
 
 
 
-      const unsigned int dim = mesh.mesh_dimension();
-      const DofMap & dof_map = es.get_system("bidomain").get_dof_map();
-      const DofMap & dof_map2 = es.get_system("Recovery").get_dof_map();
+      if(integrator.compare(0,4,"SBDF") == 0){
+    	    TransientLinearImplicitSystem & Bsystem = es.get_system <TransientLinearImplicitSystem> ("bidomain");
+			Bsystem.update();
+			auto femSolu = es.get_system("bidomain").variable_number("V");
+			auto femSolu2 = es.get_system("bidomain").variable_number("Ve");
+			const DofMap & dof_map = es.get_system("bidomain").get_dof_map();
+			FEType fe_type = dof_map.variable_type(femSolu);
+			std::unique_ptr<FEBase> fe (FEBase::build(dim, fe_type));
+			fe->attach_quadrature_rule (&qrule);
+			const std::vector<Point> & q_point = fe->get_xyz();
+			const std::vector<Real> & JxW = fe->get_JxW();
+			const std::vector<std::vector<Real>> & phi = fe->get_phi();
 
-      FEType fe_type = dof_map.variable_type(femSolu);
-      std::unique_ptr<FEBase> fe (FEBase::build(dim, fe_type));
+			  for(const auto & node : mesh.local_node_ptr_range()){
 
-      QGauss qrule (dim, TENTH);
+			  dof_map.dof_indices (node, dof_indices);
+			  dof_map2.dof_indices (node, dof_indices2);
 
-        // Tell the finite element object to use our quadrature rule.
-      fe->attach_quadrature_rule (&qrule);
+			  const Real x = (*node)(0);
+			  const Real y = (*node)(1);
 
-      const std::vector<Point> & q_point = fe->get_xyz();
-      const std::vector<Real> & JxW = fe->get_JxW();
-      const std::vector<std::vector<Real>> & phi = fe->get_phi();
+			  if(dof_indices2.size() > 0){
 
-      int rowsn = 0;
-      int colsn = 0;
+				u_exact = exact_solutionV_all(x, y, 2, 0.0, 0.0, xDim);
+				Bsystem.solution -> set(dof_indices[femSolu],u_exact);
+				ue_exact = exact_solutionV_all(x, y, 3, 0.0, 0.0, xDim);
+				Bsystem.solution -> set(dof_indices[femSolu2],ue_exact);
 
-      double u_h, u_exact, ue_h, ue_exact;
+			  }
+			  else{
+				ue_exact = exact_solutionV_all(x, y, 4, 0.0, 0.0, xDim);
+				Bsystem.solution -> set(dof_indices[femSolu2],ue_exact);
+			  }
+			}
 
-      std::vector<dof_id_type> dof_indices;
-      std::vector<dof_id_type> dof_indices2;
+		  Bsystem.solution -> close();
+      }
+      else{
 
-        for(const auto & node : mesh.local_node_ptr_range()){
+    	    libMesh::LinearImplicitSystem &Esystem = es.get_system < libMesh::LinearImplicitSystem > ("elliptic");
+    	    libMesh::TransientLinearImplicitSystem & Psystem = es.get_system < libMesh::TransientLinearImplicitSystem > ("parabolic");
+			Esystem.update();
+			Psystem.update();
+			auto femSolu = es.get_system("parabolic").variable_number("V");
+			auto femSolu2 = es.get_system("elliptic").variable_number("Ve");
+			const DofMap & dof_map = es.get_system("elliptic").get_dof_map();
+			const DofMap & dof_mapP = es.get_system("parabolic").get_dof_map();
+			FEType fe_type = dof_map.variable_type(femSolu2);
+			std::unique_ptr<FEBase> fe (FEBase::build(dim, fe_type));
+			fe->attach_quadrature_rule (&qrule);
+			const std::vector<Point> & q_point = fe->get_xyz();
+			const std::vector<Real> & JxW = fe->get_JxW();
+			const std::vector<std::vector<Real>> & phi = fe->get_phi();
 
-                  dof_map.dof_indices (node, dof_indices);
-                  dof_map2.dof_indices (node, dof_indices2);
+			  for(const auto & node : mesh.local_node_ptr_range()){
 
-                  const Real x = (*node)(0);
-                  const Real y = (*node)(1);
+			  dof_map.dof_indices (node, dof_indices);
+			  dof_mapP.dof_indices (node, dof_indicesP);
 
-                  if(dof_indices2.size() > 0){
+			  const Real x = (*node)(0);
+			  const Real y = (*node)(1);
 
-                    u_exact = exact_solutionV_all(x, y, 2, 0.0, 0.0, xDim);
-                    Bsystem.solution -> set(dof_indices[femSolu],u_exact);
-                    ue_exact = exact_solutionV_all(x, y, 3, 0.0, 0.0, xDim);
-                    Bsystem.solution -> set(dof_indices[femSolu2],ue_exact);
+			  //libMesh::out << "CHECKING FOR ERROR" << std::endl;
 
-                  }
-                  else{
-                    ue_exact = exact_solutionV_all(x, y, 4, 0.0, 0.0, xDim);
-                    Bsystem.solution -> set(dof_indices[femSolu2],ue_exact);
-                  }
+			  if(dof_indicesP.size() == dof_indices.size()){
+				  //libMesh::out << "INSIDE" << std::endl;
+				u_exact = exact_solutionV_all(x, y, 2, 0.0, 0.0, xDim);
+				Psystem.solution -> set(dof_indicesP[femSolu],u_exact);
+				ue_exact = exact_solutionV_all(x, y, 3, 0.0, 0.0, xDim);
+				Esystem.solution -> set(dof_indices[femSolu2],ue_exact);
 
+			  }
+			  else{
+				ue_exact = exact_solutionV_all(x, y, 4, 0.0, 0.0, xDim);
+				Esystem.solution -> set(dof_indices[femSolu2],ue_exact);
+			  }
+			}
 
-
-                }
-
-              Bsystem.solution -> close();
-      
-
-      
-
+		  Psystem.solution -> close();
+		  Esystem.solution -> close();
+      }
 
 
 }
 
 
-void ForcingTermConvergence (libMesh::EquationSystems &es, const double dt, const double Beta, const double Cm, const double SigmaSI, const double SigmaSE, const double SigmaBath, const double CurTime, const double xDim, const double v0, const double v1, const double v2, const double kcubic )
+void ForcingTermConvergence (libMesh::EquationSystems &es, const double dt, const double Beta, const double Cm, const double SigmaSI, const double SigmaSE, const double SigmaBath, const double CurTime, const double xDim, const double v0, const double v1, const double v2, const double kcubic, const std::string integrator )
 {
-  // Ignore unused parameter warnings when !LIBMESH_ENABLE_AMR.
-  //libmesh_ignore(es, system_name);
 
-
-  // It is a good idea to make sure we are assembling
-  // the proper system.
-  //libmesh_assert_equal_to (system_name, "bidomain");
-
-  // Get a constant reference to the mesh object.
   const MeshBase & mesh = es.get_mesh();
-
-  // The dimension that we are running
   const unsigned int dim = mesh.mesh_dimension();
-
-  // Get a reference to the Convection-Diffusion system object.
-  //LinearImplicitSystem & Esystem = es.get_system<LinearImplicitSystem> ("Elliptic");
-  TransientLinearImplicitSystem & Bsystem = es.get_system <TransientLinearImplicitSystem> ("bidomain");
-
-  //ExplicitSystem & system2 = es.get_system<ExplicitSystem> ("Restitution");
-
-  //TransientLinearImplicitSystem & system3 = es.get_system<TransientLinearImplicitSystem> ("MembraneUstar");
-
-  // Get a constant reference to the Finite Element type
-  // for the first (and only) variable in the system.
-  FEType fe_type_V = Bsystem.variable_type(0);
-  //FEType fe_type_Ve = Bsystem.variable_type(1);
-  //FEType fe_type2 = Psystem.variable_type(0);
-  // Build a Finite Element object of the specified type.  Since the
-  // FEBase::build() member dynamically creates memory we will
-  // store the object as a std::unique_ptr<FEBase>.  This can be thought
-  // of as a pointer that will clean up after itself.
-  std::unique_ptr<FEBase> fe      (FEBase::build(dim, fe_type_V));
-  //std::unique_ptr<FEBase> fe2      (FEBase::build(dim, fe_type_Ve));
-  std::unique_ptr<FEBase> fe_face (FEBase::build(dim, fe_type_V));
-
-  // A Gauss quadrature rule for numerical integration.
-  // Let the FEType object decide what order rule is appropriate.
-  QGauss qrule (dim,  TENTH);
-  //QGauss qrule2 (dim,   fe_type2.default_quadrature_order());
-  QGauss qface (dim-1, TENTH);
-
-  // Tell the finite element object to use our quadrature rule.
-  fe->attach_quadrature_rule      (&qrule);
-  //fe2->attach_quadrature_rule      (&qrule);
-  fe_face->attach_quadrature_rule (&qface);
-
-  // Here we define some references to cell-specific data that
-  // will be used to assemble the linear system.  We will start
-  // with the element Jacobian * quadrature weight at each integration point.
-  const std::vector<Real> & JxW      = fe->get_JxW();
-  //const std::vector<Real> & JxW2      = fe2->get_JxW();
-  const std::vector<Real> & JxW_face = fe_face->get_JxW();
-
-  // The element shape functions evaluated at the quadrature points.
-  const std::vector<std::vector<Real>> & phi = fe->get_phi();
-  //const std::vector<std::vector<Real>> & phi2 = fe2->get_phi();
-  const std::vector<std::vector<Real>> & psi = fe_face->get_phi();
-
-  // The element shape function gradients evaluated at the quadrature
-  // points.
-  const std::vector<std::vector<RealGradient>> & dphi = fe->get_dphi();
-  //const std::vector<std::vector<RealGradient>> & dphi2 = fe2->get_dphi();
-
-  // The XY locations of the quadrature points used for face integration
-  const std::vector<Point> & q_point = fe->get_xyz();
-  const std::vector<Point> & qface_points = fe_face->get_xyz();
-
-  // A reference to the DofMap object for this system.  The DofMap
-  // object handles the index translation from node and element numbers
-  // to degree of freedom numbers.  We will talk more about the DofMap
-  // in future examples.
-  const DofMap & dof_map = Bsystem.get_dof_map();
-  //const DofMap & dof_map2 = Bsystem.get_dof_map();
-  //const DofMap & dof_map2 = system2.get_dof_map();
-
-  // Define data structures to contain the element matrix
-  // and right-hand-side vector contribution.  Following
-  // basic finite element terminology we will denote these
-  // "Ke" and "Fe".
-
-  DenseVector<Number> Fe;
-
-
-
-  DenseSubVector<Number>
-    FV(Fe),
-    FVe(Fe);
-
-
-  //DenseMatrix<Number> Rloc;
-
-  // This vector will hold the degree of freedom indices for
-  // the element.  These define where in the global system
-  // the element degrees of freedom get mapped.
+  QGauss qrule (dim,  FIFTH);
+  QGauss qface (dim-1, SECOND);
   std::vector<dof_id_type> dof_indices;
   std::vector<dof_id_type> dof_indices_V;
   std::vector<dof_id_type> dof_indices_Ve;
-  //std::vector<dof_id_type> dof_indices2;
-
-  // Here we extract the velocity & parameters that we put in the
-  // EquationSystems object.
-
-  //const Real dt = es.parameters.get<Real>   ("dt");
-
-  //SparseMatrix<Number> & matrix = Bsystem.get_system_matrix();
-
-  //SparseMatrix<Number> & matrix = Esystem.get_system_matrix();
-
-  // Now we will loop over all the elements in the mesh that
-  // live on the local processor. We will compute the element
-  // matrix and right-hand-side contribution.  Since the mesh
-  // will be refined we want to only consider the ACTIVE elements,
-  // hence we use a variant of the active_elem_iterator.
-  /*for(const auto & node : mesh.local_node_ptr_range()){
 
 
-    dof_map.dof_indices (node, dof_indices);
 
-    if (elem->subdomain_id()==1){
-      dof_map2.dof_indices (node, dof_indices2);
-    }
+
+
+  if(integrator.compare(0,4,"SBDF") == 0){
+
+	  TransientLinearImplicitSystem & Bsystem = es.get_system <TransientLinearImplicitSystem> ("bidomain");
+	  FEType fe_type_V = Bsystem.variable_type(0);
+	  std::unique_ptr<FEBase> fe      (FEBase::build(dim, fe_type_V));
+	  std::unique_ptr<FEBase> fe_face (FEBase::build(dim, fe_type_V));
+	  fe->attach_quadrature_rule      (&qrule);
+	  fe_face->attach_quadrature_rule (&qface);
+	  const std::vector<Real> & JxW      = fe->get_JxW();
+	  const std::vector<Real> & JxW_face = fe_face->get_JxW();
+	  const std::vector<std::vector<Real>> & phi = fe->get_phi();
+	  const std::vector<std::vector<Real>> & psi = fe_face->get_phi();
+	  const std::vector<std::vector<RealGradient>> & dphi = fe->get_dphi();
+	  const std::vector<Point> & q_point = fe->get_xyz();
+	  const std::vector<Point> & qface_points = fe_face->get_xyz();
+	  const DofMap & dof_map = Bsystem.get_dof_map();
+
+	  DenseVector<Number> Fe;
+	  DenseSubVector<Number>
+		FV(Fe),
+		FVe(Fe);
+
+	  for (const auto & elem : mesh.active_local_element_ptr_range())
+		{
+		  dof_map.dof_indices (elem, dof_indices);
+		  dof_map.dof_indices (elem, dof_indices_V, 0);
+		  dof_map.dof_indices (elem, dof_indices_Ve, 1);
+
+		  const unsigned int n_dofs   = dof_indices.size();
+		  const unsigned int n_V_dofs = dof_indices_V.size();
+		  const unsigned int n_Ve_dofs = dof_indices_Ve.size();
+
+		  fe->reinit (elem);
+
+		  Fe.resize (n_dofs);
+
+		  FV.reposition (0*n_V_dofs, n_V_dofs);
+		  FVe.reposition (1*n_V_dofs, n_Ve_dofs);
+
+			for (unsigned int qp=0; qp<qrule.n_points(); qp++)
+			{
+			  for (unsigned int i=0; i<n_V_dofs; i++){
+				FV(i) += JxW[qp]*((    CalculateF( q_point[qp](0), q_point[qp](1), 0, CurTime, 0.0, dt, Beta, Cm, SigmaSI, SigmaSE, SigmaBath, xDim, v0, v1, v2, kcubic)      )*(phi[i][qp]));
+			  }
+			  for (unsigned int i=0; i<n_Ve_dofs; i++){
+				if(elem->subdomain_id()==1){
+				  FVe(i) += JxW[qp]*((     CalculateF( q_point[qp](0), q_point[qp](1), 1, CurTime, 0.0, dt, Beta, Cm, SigmaSI, SigmaSE, SigmaBath, xDim, v0, v1, v2, kcubic)      )*(phi[i][qp]));
+				}
+				else{
+				  FVe(i) += JxW[qp]*((     CalculateF( q_point[qp](0), q_point[qp](1), 2, CurTime, 0.0, dt, Beta, Cm, SigmaSI, SigmaSE, SigmaBath, xDim, v0, v1, v2, kcubic)     )*(phi[i][qp]));
+				}
+			  }
+
+			  }
+			{
+					//BOUNDARIES
+							  for (auto s : elem->side_index_range()){
+
+								//libMesh::out << elem << std::endl;
+											if (elem->neighbor_ptr(s) == nullptr)
+											  {
+											  //libMesh::out << "SOMETHING        " << s << std::endl;
+
+												std::unique_ptr<const Elem> side (elem->build_side_ptr(s,false));
+												//libMesh::out << side.get() << std::endl;
+												// Loop over the nodes on the side.
+												for (auto ns : side->node_index_range())
+												  {
+													// The location on the boundary of the current
+													// node.
+												  //libMesh::out << ns << std::endl;
+
+													const Real xf = side->point(ns)(0);
+													const Real yf = side->point(ns)(1);
+
+													// The penalty value.  \f$ \frac{1}{\epsilon \f$
+													const Real penalty = 1.e10;
+
+													// The boundary values.
+
+													// Set v = 0 everywhere
+													double Ve_value;
+													Ve_value = exact_solutionV_all( xf, yf, 4, CurTime, 0.0, xDim);
+
+
+													// Find the node on the element matching this node on
+													// the side.  That defined where in the element matrix
+													// the boundary condition will be applied.
+													//libMesh::out << "  BEFORE CONDITIONS " << std::endl;
+
+													for (auto n : elem->node_index_range()){
+													  if (elem->node_id(n) == side->node_id(ns) && s == 1 || s == 3)
+														{
+														  // Matrix contribution.
+														  //KVeVe(n,n) += penalty;
+														  //Kvv(n,n) += penalty;
+
+														  // Right-hand-side contribution.
+														  FVe(n) += penalty*Ve_value;
+														  //Fv(n) += penalty*v_value;
+														}
+													  }
+
+													//libMesh::out << "  AFTER CONDITIONS " << std::endl;
+
+												  } // end face node loop
+											  }
+							  }// end if (elem->neighbor(side) == nullptr)
+
+			 }
+
+			Bsystem.get_vector("ForcingConv").add_vector    (Fe, dof_indices);
+		}
+
+		  Bsystem.get_vector("ForcingConv").close();
 
 
   }
-  */
-  //libMesh::out << "  BEFORE LOOPING " << std::endl;
 
-  for (const auto & elem : mesh.active_local_element_ptr_range())
-    {
-      // Get the degree of freedom indices for the
-      // current element.  These define where in the global
-      // matrix and right-hand-side this element will
-      // contribute to.
-      dof_map.dof_indices (elem, dof_indices);
-      dof_map.dof_indices (elem, dof_indices_V, 0);
-      dof_map.dof_indices (elem, dof_indices_Ve, 1);
+  else{
 
-      const unsigned int n_dofs   = dof_indices.size();
-      const unsigned int n_V_dofs = dof_indices_V.size();
-      const unsigned int n_Ve_dofs = dof_indices_Ve.size();
+  	  LinearImplicitSystem & Esystem = es.get_system <LinearImplicitSystem> ("elliptic");
+  	  TransientLinearImplicitSystem & Psystem = es.get_system <TransientLinearImplicitSystem> ("parabolic");
+  	  FEType fe_type_V = Esystem.variable_type(0);
+  	  std::unique_ptr<FEBase> fe      (FEBase::build(dim, fe_type_V));
+  	  std::unique_ptr<FEBase> fe_face (FEBase::build(dim, fe_type_V));
+  	  fe->attach_quadrature_rule      (&qrule);
+  	  fe_face->attach_quadrature_rule (&qface);
+  	  const std::vector<Real> & JxW      = fe->get_JxW();
+  	  const std::vector<Real> & JxW_face = fe_face->get_JxW();
+  	  const std::vector<std::vector<Real>> & phi = fe->get_phi();
+  	  const std::vector<std::vector<Real>> & psi = fe_face->get_phi();
+  	  const std::vector<std::vector<RealGradient>> & dphi = fe->get_dphi();
+  	  const std::vector<Point> & q_point = fe->get_xyz();
+  	  const std::vector<Point> & qface_points = fe_face->get_xyz();
+  	  const DofMap & dof_mapP = Psystem.get_dof_map();
+  	  const DofMap & dof_mapE = Esystem.get_dof_map();
 
-      //dof_map2.dof_indices (elem, dof_indices2);
+  	  DenseVector<Number> FV;
+  	  DenseVector<Number> FVe;
 
-      // Compute the element-specific data for the current
-      // element.  This involves computing the location of the
-      // quadrature points (q_point) and the shape functions
-      // (phi, dphi) for the current element.
-      fe->reinit (elem);
+  	  for (const auto & elem : mesh.active_local_element_ptr_range())
+  		{
+  		  dof_mapP.dof_indices (elem, dof_indices_V);
+  		  dof_mapE.dof_indices (elem, dof_indices_Ve);
 
-      // Zero the element matrix and right-hand side before
-      // summing them.  We use the resize member here because
-      // the number of degrees of freedom might have changed from
-      // the last element.  Note that this will be the case if the
-      // element type is different (i.e. the last element was a
-      // triangle, now we are on a quadrilateral).
+  		  const unsigned int n_V_dofsP = dof_indices_V.size();
+  		  const unsigned int n_Ve_dofsE = dof_indices_Ve.size();
 
+  		  fe->reinit (elem);
 
-        //fe2->reinit (elem);
+  		  FV.resize (n_V_dofsP);
+  		  FVe.resize (n_Ve_dofsE);
 
+  			for (unsigned int qp=0; qp<qrule.n_points(); qp++)
+  			{
+  			  for (unsigned int i=0; i<n_V_dofsP; i++){
+  				FV(i) += JxW[qp]*((    CalculateF( q_point[qp](0), q_point[qp](1), 0, CurTime, 0.0, dt, Beta, Cm, SigmaSI, SigmaSE, SigmaBath, xDim, v0, v1, v2, kcubic)      )*(phi[i][qp]));
+  			  }
+  			  for (unsigned int i=0; i<n_Ve_dofsE; i++){
+  				if(elem->subdomain_id()==1){
+  				  FVe(i) += JxW[qp]*((     CalculateF( q_point[qp](0), q_point[qp](1), 1, CurTime, 0.0, dt, Beta, Cm, SigmaSI, SigmaSE, SigmaBath, xDim, v0, v1, v2, kcubic)      )*(phi[i][qp]));
+  				}
+  				else{
+  				  FVe(i) += JxW[qp]*((     CalculateF( q_point[qp](0), q_point[qp](1), 2, CurTime, 0.0, dt, Beta, Cm, SigmaSI, SigmaSE, SigmaBath, xDim, v0, v1, v2, kcubic)     )*(phi[i][qp]));
+  				}
+  			  }
 
+  			  }
+  			{
+  					//BOUNDARIES
+  							  for (auto s : elem->side_index_range()){
 
+  								//libMesh::out << elem << std::endl;
+  											if (elem->neighbor_ptr(s) == nullptr)
+  											  {
+  											  //libMesh::out << "SOMETHING        " << s << std::endl;
 
-        Fe.resize (n_dofs);
+  												std::unique_ptr<const Elem> side (elem->build_side_ptr(s,false));
+  												//libMesh::out << side.get() << std::endl;
+  												// Loop over the nodes on the side.
+  												for (auto ns : side->node_index_range())
+  												  {
+  													// The location on the boundary of the current
+  													// node.
+  												  //libMesh::out << ns << std::endl;
 
+  													const Real xf = side->point(ns)(0);
+  													const Real yf = side->point(ns)(1);
 
+  													// The penalty value.  \f$ \frac{1}{\epsilon \f$
+  													const Real penalty = 1.e10;
 
+  													// The boundary values.
 
-      //Rloc.resize (dof_indices.size(), dof_indices.size());
-      //libMesh::out << Rloc.size() << std::endl;
-
-      //Rloc = es.parameters.get<DenseMatrix <Number> >("rlocal");
-
-
-
-          //THIS IS NOW DEPENDENT ON FF,SS,NN
-
-          //sigma(0,0) = 1.;
-          //sigma(1,1) = 1.;
-          //sigma(2,2) = 1.;
-
-      //double Cm = InParam[6]; //uF/cm^2
-      //double Beta = InParam[9]; //cm^-1
-
-      //libMesh::out << Beta << " is the surface-volume ratio" << std::endl;
-
-      // Now we will build the element matrix and right-hand-side.
-      // Constructing the RHS requires the solution and its
-      // gradient from the previous timestep.  This myst be
-      // calculated at each quadrature point by summing the
-      // solution degree-of-freedom values by the appropriate
-      // weight functions.
-
-
-      FV.reposition (0*n_V_dofs, n_V_dofs);
-      FVe.reposition (1*n_V_dofs, n_Ve_dofs);
-
-      //libMesh::out << "  BEFORE LOOPING QP " << std::endl;
-      //if (elem->subdomain_id()==1){
-        for (unsigned int qp=0; qp<qrule.n_points(); qp++)
-        {
-          // Values to hold the old solution & its gradient.
-
-          //Gradient grad_u_old;
-
-
-          //grad_u_old = es.get_system("Convection-Diffusion").point_value(femSolu, q_point[qp], elem);
-
-          // Compute the old solution & its gradient.
-          /*
-          for (std::size_t l=0; l<phi.size(); l++)
-            {
-              //u_old += phi[l][qp]*Esystem.old_solution  (dof_indices[l]);
-              //u_h = es.get_system("Convection-Diffusion").point_value(femSolu, q_point[qp], elem);
-              //u_old += phi[l][qp]*Esystem.old_solution  (dof_indices[l]);
+  													// Set v = 0 everywhere
+  													double Ve_value;
+  													Ve_value = exact_solutionV_all( xf, yf, 4, CurTime, 0.0, xDim);
 
 
-              // This will work,
-              // grad_u_old += dphi[l][qp]*Esystem.old_solution (dof_indices[l]);
-              // but we can do it without creating a temporary like this:
-              //grad_u_old.add_scaled (dphi[l][qp], Esystem.old_solution (dof_indices[l]));
-            }
-            */
+  													// Find the node on the element matching this node on
+  													// the side.  That defined where in the element matrix
+  													// the boundary condition will be applied.
+  													//libMesh::out << "  BEFORE CONDITIONS " << std::endl;
 
-          //FeV
-          //libMesh::out << "  BEFORE FV  " << std::endl;
-          for (unsigned int i=0; i<n_V_dofs; i++){
+  													for (auto n : elem->node_index_range()){
+  													  if (elem->node_id(n) == side->node_id(ns) && (s == 1 || s == 3))
+  														{
+  														  // Matrix contribution.
+  														  //KVeVe(n,n) += penalty;
+  														  //Kvv(n,n) += penalty;
 
-            //FV(i) = JxW[qp]*(    (Beta*Cm/dt)*exact_solutionV(q_point[qp](0),q_point[qp](1), 2, Bsystem.time+dt, 0.0) + sigmaSI*exact_solutionV(q_point[qp](0),q_point[qp](1), 200, Bsystem.time+dt, 0.0) + sigmaSI*exact_solutionV(q_point[qp](0),q_point[qp](1), 300, Bsystem.time+dt, 0.0)      );
-            
+  														  // Right-hand-side contribution.
+  														  FVe(n) += penalty*Ve_value;
+  														  //Fv(n) += penalty*v_value;
+  														}
+  													  }
 
-            FV(i) += JxW[qp]*((    CalculateF( q_point[qp](0), q_point[qp](1), 0, CurTime, 0.0, dt, Beta, Cm, SigmaSI, SigmaSE, SigmaBath, xDim, v0, v1, v2, kcubic)      )*(phi[i][qp]));
-          
-          
-          }
+  													//libMesh::out << "  AFTER CONDITIONS " << std::endl;
 
+  												  } // end face node loop
+  											  }
+  							  }// end if (elem->neighbor(side) == nullptr)
 
+  			 }
 
-          //FeVe
-          //libMesh::out << "  BEFORE FVE  " << std::endl;
-          for (unsigned int i=0; i<n_Ve_dofs; i++){
+  			Psystem.get_vector("ForcingV").add_vector    (FV, dof_indices_V);
+  			Esystem.get_vector("ForcingVe").add_vector    (FVe, dof_indices_Ve);
+  		}
 
-            if(elem->subdomain_id()==1){
-
-              FVe(i) += JxW[qp]*((     CalculateF( q_point[qp](0), q_point[qp](1), 1, CurTime, 0.0, dt, Beta, Cm, SigmaSI, SigmaSE, SigmaBath, xDim, v0, v1, v2, kcubic)      )*(phi[i][qp]));
-            
-            }
-
-            else{
-
-              FVe(i) += JxW[qp]*((     CalculateF( q_point[qp](0), q_point[qp](1), 2, CurTime, 0.0, dt, Beta, Cm, SigmaSI, SigmaSE, SigmaBath, xDim, v0, v1, v2, kcubic)     )*(phi[i][qp]));
-            
-            }
-
-          }
+  		  Psystem.get_vector("ForcingV").close();
+  		  Esystem.get_vector("ForcingVe").close();
 
 
+    }
 
-        }
-
-        {
-
-              // The penalty value.
-          //libMesh::out << "  BEFORE ADDING BC  " << std::endl;
-                          for (auto s : elem->side_index_range()){
-
-                            //libMesh::out << elem << std::endl;
-                                        if (elem->neighbor_ptr(s) == nullptr)
-                                          {
-                                          //libMesh::out << "SOMETHING        " << s << std::endl;
-
-                                            std::unique_ptr<const Elem> side (elem->build_side_ptr(s,false));
-                                            //libMesh::out << side.get() << std::endl;
-                                            // Loop over the nodes on the side.
-                                            for (auto ns : side->node_index_range())
-                                              {
-                                                // The location on the boundary of the current
-                                                // node.
-                                              //libMesh::out << ns << std::endl;
-
-                                                const Real xf = side->point(ns)(0);
-                                                const Real yf = side->point(ns)(1);
-
-                                                // The penalty value.  \f$ \frac{1}{\epsilon \f$
-                                                const Real penalty = 1.e10;
-
-                                                // The boundary values.
-
-                                                // Set v = 0 everywhere
-                                                double Ve_value;
-                                                Ve_value = exact_solutionV_all( xf, yf, 4, CurTime, 0.0, xDim);
-                                                
-                                                
-                                                // Find the node on the element matching this node on
-                                                // the side.  That defined where in the element matrix
-                                                // the boundary condition will be applied.
-                                                //libMesh::out << "  BEFORE CONDITIONS " << std::endl;
-                                                
-                                                for (auto n : elem->node_index_range()){
-                                                  if (elem->node_id(n) == side->node_id(ns) && s == 1 || s == 3)
-                                                    {
-                                                      // Matrix contribution.
-                                                      //KVeVe(n,n) += penalty;
-                                                      //Kvv(n,n) += penalty;
-
-                                                      // Right-hand-side contribution.
-                                                      FVe(n) += penalty*Ve_value;
-                                                      //Fv(n) += penalty*v_value;
-                                                    }
-                                                  }
-                                                
-                                                //libMesh::out << "  AFTER CONDITIONS " << std::endl;
-
-                                              } // end face node loop
-                                          }
-                          }// end if (elem->neighbor(side) == nullptr)
-
-                }
-
-
-      // At this point the interior element integration has
-      // been completed.  However, we have not yet addressed
-      // boundary conditions.  For this example we will only
-      // consider simple Dirichlet boundary conditions imposed
-      // via the penalty method.
-      //
-      // The following loops over the sides of the element.
-      // If the element has no neighbor on a side then that
-      // side MUST live on a boundary of the domain.
-        //libMesh::out << "  BEFORE ADDING VECTOR  " << std::endl;
-
-        Bsystem.get_vector("ForcingConv").add_vector    (Fe, dof_indices);
-
-        //libMesh::out << "  AFTER ADDING VECTOR  " << std::endl;
 
 }
 
-  //libMesh::out << "  AFTER LOOPING     " << Bsystem.rhs << std::endl;
-
-      Bsystem.get_vector("ForcingConv").close();
-
-      //libMesh::out << "  AFTER CLOSE " << std::endl;
-
-
-
-}
 
 
 
