@@ -9,37 +9,47 @@
 %   Diffuse           .07    .44    2.17     11       .49   1.22    0     -
 %   Patchy            .32    .78    2.50     68       .42   2.10   .38   .31
 
+%Density (according to table, but just suggested, also can vary based on
+%desired density):
+%Interstitial: 9.6%
+%Compact: 47.2%
+%Diffuse: 22.0%
+%Patchy: 26.9%
+
 %Base Noise field
-lb = .96;             %[.01, 2]   Base size of fibrotic obstacles (mm)
+lb = .32;             %[.01, 2]   Base size of fibrotic obstacles (mm)
 lb = lb/10;           %now in cm
-R = 2.47;                %[.5, 50]   Anisotropy of base obstacles
-gamma = .59;           %[0, .99]   Roughness of base noise field
+R = 2.50;                %[.5, 50]   Anisotropy of base obstacles
+gamma = .78;           %[0, .99]   Roughness of base noise field
 
 %Density Variation Noise field
-ld = 2.03;               %[1, 8]   Size of density variation features (mm)
+ld = 2.10;               %[1, 8]   Size of density variation features (mm)
 ld = ld/10;           %now in cm
 
 %Fiber selection Noise field
-L = 10;               %[.3, 2]   Base separation distance of fibres
+L = .31;               %[.3, 2]   Base separation distance of fibres
 L = L/10;
 phi_fiber_orientation = 68;                             %[-pi/2, pi/2]   Fibre orientation in degrees
 phi_fiber_orientation = -phi_fiber_orientation*pi/180;          %now in radians
 
 %Others
-f = 0;                     %[0, .4]   Extent of pattern coincidence with fibres
+f = .38;                     %[0, .4]   Extent of pattern coincidence with fibres
 d = .42;                    %[0, .5]   Magnitude of local density variation
 
 Seed = 1;
 numEl = 512;
 width = numEl;
 
-fibrosisDensity_desired = 20;% in percentage: 20 = 20%, 30 = 30%, 40 = 40%, etc. not decimals
+fibrosisDensity_desired = 26.9;% in percentage: 20 = 20%, 30 = 30%, 40 = 40%, etc. not decimals
 
 %Fixed: Fiber selection Noise field
 s = 15;   %Sharpening factor
 phi_phase_modulation = 10*pi;   %Strength of phase modulation
-Beta_dissimilarity = .15;   %Dissimilarity between fibres
-Beta_wiggliness = .15;   %Fibre ?wiggliness?
+Beta_dissimilarity = .25;   %Dissimilarity between fibres
+Beta_wiggliness = .25;   %Fibre ?wiggliness?
+
+Beta_dissimilarity = Beta_dissimilarity*5;
+Beta_wiggliness = Beta_wiggliness*60;
 
 Nf = 4; %number of octaves of Perlin noise
 
@@ -104,6 +114,17 @@ for x = 1:IMG_W*TrialVal
   end
 end
 
+randomVectorGrid = zeros(IMG_W*TrialVal,IMG_H*TrialVal, 2);
+   
+% draw the whitenoise
+for x = 1:IMG_W*TrialVal
+  for y = 1:IMG_H*TrialVal
+        v= 2*rand(2,1)-1;
+        n=v/sqrt(v(1)^2+v(2)^2);
+        randomVectorGrid(x,y,:) = n;
+  end
+end
+
 for x = 1:IMG_W
   for y = 1:IMG_H
         img(y,x) = (WhiteNoise(x,y)+1)*125;
@@ -136,7 +157,7 @@ F_field_img = ones(IMG_H,IMG_W);
 I_perlinMatrix = zeros(IMG_H, IMG_W);
 I_final = ones(IMG_H,IMG_W);
 
-% [gX,gY] = gradient(WhiteNoise);
+[gX,gY] = gradient(WhiteNoise);
 % gX = rescale(gX); 
 % gY = rescale(gY); 
 
@@ -149,7 +170,7 @@ for x = 1:IMG_W
         %perlin = perlinNoise2d(x, y, 0.1, 4, IMG_W, IMG_H, WhiteNoise);
         xV_Nb = (1./lb).*([X(x,y), Y(x,y)]*A_R);
 %         xV_Nb = (1./lb).*([x, y]*A_R);
-        perlinNb = perlinNoise2d(xV_Nb(1), xV_Nb(2), gamma, Nf, IMG_W, IMG_H, WhiteNoise);
+        perlinNb = perlinNoise2d(xV_Nb(1), xV_Nb(2), gamma, Nf, IMG_W, IMG_H, WhiteNoise, randomVectorGrid);
         %perlin = perlinNoise2d(50*X(x,y)+2, 10*Y(x,y)+2, 0.1, 4, IMG_W, IMG_H, WhiteNoise);
         Nb_perlinMatrix(x,y) = perlinNb;
         cRGB_Nb = floor(1+ (perlinNb - 0) / (1 - 0) * (256-1)); 
@@ -159,7 +180,7 @@ for x = 1:IMG_W
         
         %N_d DENSITY VARIATION PERLIN NOISEFIELD
         xV_Nd = (1./ld).*([X(x,y), Y(x,y)]);
-        perlinNd = perlinNoise2d(xV_Nd(1), xV_Nd(2), .5, Nf, IMG_W, IMG_H, WhiteNoise);
+        perlinNd = perlinNoise2d(xV_Nd(1), xV_Nd(2), .5, Nf, IMG_W, IMG_H, WhiteNoise, randomVectorGrid);
         Nd_perlinMatrix(x,y) = perlinNd;
         cRGB_Nd = floor(1+ (perlinNd - 0) / (1 - 0) * (256-1)); 
         %cRGB_Nd = floor(1.7932 + (perlinNd - (-1.3009)) / (1.7932 - -1.3009) * (256-1));
@@ -167,8 +188,14 @@ for x = 1:IMG_W
         
         
         %F FIBER SELECTION NOISEFIELD
-        xV_F = (([X(x,y), Y(x,y)] * (R_phi)) * [(Beta_wiggliness), 0; 0, (Beta_dissimilarity./L)] );
-        Z_field = (phi_phase_modulation).*perlinNoise2d(xV_F(1), xV_F(2), .5, Nf, IMG_W, IMG_H, WhiteNoise);
+        
+        %With rotation included
+        xV_F = (([X(x,y), Y(x,y)] * (R_phi)) * [(Beta_wiggliness), 0; 0, (Beta_dissimilarity/L)] );
+        
+        %Without rotation included
+%         xV_F = (([X(x,y), Y(x,y)]) * [(Beta_wiggliness), 0; 0, (Beta_dissimilarity./L)] );
+        
+        Z_field = (phi_phase_modulation).*perlinNoise2d(xV_F(1), xV_F(2), .5, Nf, IMG_W, IMG_H, WhiteNoise, randomVectorGrid);
         perlinF = (.5 + .5*cos( (2*pi/L)*xV_F(2) + Z_field ) ).^s;
         F_perlinMatrix(x,y) = perlinF;
         %cRGB_F = floor(1+ (perlinF - 0) / (1 - 0) * (256-1));
@@ -310,14 +337,14 @@ drawnow
 
 
 %plotting in grid itself
-fibroticInd = find(I_final == colorFibrosis);
-tissueInd = find(I_final == colorTissue);
-
-figure
-plot(X(tissueInd),Y(tissueInd),"oy")
-hold on
-plot(X(fibroticInd),Y(fibroticInd),"or")
-grid on
+% fibroticInd = find(I_final == colorFibrosis);
+% tissueInd = find(I_final == colorTissue);
+% 
+% figure
+% plot(X(tissueInd),Y(tissueInd),"oy")
+% hold on
+% plot(X(fibroticInd),Y(fibroticInd),"or")
+% grid on
 
 % these indices are the ones that will be used to set the specific
 %conductivities differently.
@@ -394,14 +421,17 @@ end
 
 
 
-function res = perlinNoise2d(x,y, gamma, Nf, IMG_W, IMG_H, WhiteNoise)
+function res = perlinNoise2d(x,y, gamma, Nf, IMG_W, IMG_H, WhiteNoise, g)
     P_total = 0;
+    
     for i = 1:Nf
         frequency = 2^(i-1); 
         amplitude = gamma^(i-1);
         offsetV = -.5 + (.5+.5).*rand(1,1);
+%         offsetVector(i) = offsetV;
+%         offsetV = 0;
         P_total = P_total + interpolatedNoise2d(x*frequency + offsetV,y*frequency + offsetV, IMG_W, IMG_H, WhiteNoise)*amplitude;
-%         P_total = P_total + Perlin_Noise_Jakes(x*frequency + offsetV,y*frequency + offsetV, 0.0039, 0.0039, gX,gY, IMG_W, IMG_H)*amplitude;
+%         P_total = P_total + Perlin_Noise_Jakes(x*frequency + offsetV, y*frequency + offsetV, g, IMG_W, IMG_H)*amplitude;
         
     end
 
