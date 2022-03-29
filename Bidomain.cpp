@@ -704,6 +704,7 @@ int main(int argc, char **argv)
         // advance time
         datatime.time += datatime.dt;
         datatime.timestep++;
+
         //std::cout << "Time: " << datatime.time << std::endl;
         // advance vectors and solve
         // Bidomain System
@@ -767,7 +768,7 @@ int main(int argc, char **argv)
                 {
                      // Solve Parabolic
                      assemble_rhs(es, datatime, time_integrator, order, data, EquationType::PARABOLIC);
-                     //*parabolic_system.rhs -= parabolic_system.get_vector("ForcingV");
+                     // *parabolic_system.rhs -= parabolic_system.get_vector("ForcingV");
                      parabolic_system.solve();
                      parabolic_system.update();
                 }
@@ -2557,7 +2558,7 @@ void assemble_rhs(  libMesh::EquationSystems &es,
                    time_integrator == TimeIntegrator::SEMI_IMPLICIT_HALF_STEP)
                 {
                     parabolic_system.get_vector("aux1").zero();
-                    parabolic_system.get_vector("aux1").pointwise_mult(*parabolic_system.solution, parabolic_system.get_vector("ML"));
+                    parabolic_system.get_vector("aux1").pointwise_mult(*parabolic_system.old_local_solution, parabolic_system.get_vector("ML"));
                     *parabolic_system.rhs += parabolic_system.get_vector("aux1");
                 }
                 else
