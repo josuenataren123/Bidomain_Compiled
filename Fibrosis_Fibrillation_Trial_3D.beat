@@ -1,0 +1,107 @@
+# OUTPUT FOLDER
+output_folder = output_Fibrillation_Trial
+convergence_test = false
+convergence_test_save = false
+
+#Fibrosis
+fibrosisBool = true
+fibrosis_coords_matrix = fibrosis_Coords_Large_Compact_n70_25_3D.csv
+fibrosisMethod = Percolation
+#Percolation or Conductivities
+
+# MESH
+mesh_filename = NONE
+# number of elements
+nelx = 70
+nely = 70
+nelz = 70
+# size
+maxx = 2.85
+maxy = 2.85
+maxz = 0.7
+minx = -2.85
+miny = -2.85
+minz = -0.7
+# element type
+eltype = HEX8
+# tissue box subdomain
+tissue_maxx = 2.85
+tissue_maxy = 2.85
+tissue_maxz = .1
+tissue_minx = -2.85
+tissue_miny = -2.85
+tissue_minz = -.1
+# stimulus box subdomain
+stimulus_maxx = 2.
+stimulus_maxy = 1.45
+stimulus_maxz = -.08
+stimulus_minx = -2.
+stimulus_miny = 0.
+stimulus_minz = -.1
+stimulus_duration = 2.
+stimulus_amplitude = -2.25
+#for Transmembrane: -1 with 2ms
+#for Extracellular: -1 with 2ms
+#for Extracellular: 1 with 2ms
+stimulus_start_time = 0.0
+stimulus_type = Transmembrane
+#Transmembrane or Extracellular
+SpiralBool = 2
+# ionic model
+# cubic:
+k = 8.0
+v0 = 0
+v1 = 0.05
+v2 = 1.0
+
+# TIME DATA
+end_time = 1000.
+dt = 0.025
+export_timesteps = 40
+#Time Integrator
+integrator = EXPLICIT_INTRACELLULAR
+# FEM
+p_order = 1
+# Dirichlet boundary conditions:
+bcs = '0 2'
+
+# FIBER FIELDS
+# f = longitudinal
+fx = 1.0
+fy = 0.0
+fz = 0.0
+# s = transversal
+sx = 0.0
+sy = 1.0
+sz = 0.0
+# n = normal
+nx = 0.0
+ny = 0.0
+nz = 1.0
+
+# penalty for imposing BC
+penalty = 1e8
+
+# PARAMETERS
+#Healthy
+sigma_f_i = 2.3172
+sigma_s_i = 0.2435
+sigma_n_i = 0.0569
+sigma_f_e = 1.5448
+sigma_s_e = 1.0438
+sigma_n_e = 0.37222
+sigma_b= 20.0
+sigma_torso = .6
+
+#Diseased
+#sigma_f_i = .4172
+#sigma_s_i = 0.3235
+#sigma_n_i = 0.0269
+#sigma_f_e = .5448
+#sigma_s_e = .4438
+#sigma_n_e = 0.19222
+#sigma_b= 20.0
+#sigma_torso = .6
+
+chi = 2e3
+Cm = 1.0

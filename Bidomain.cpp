@@ -54,15 +54,30 @@
 #include "libmesh/vtk_io.h"
 #include <iomanip>      // std::setw
 
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <sstream>
+
+#include <algorithm>
+
+#include "petscksp.h"
+PetscErrorCode  KSPSetNullSpace(KSP ksp,MatNullSpace nullsp);
+
 
 
 
 using namespace libMesh;
 
+double round_up(double value, int decimal_places) {
+    const double multiplier = std::pow(10.0, decimal_places);
+    return std::floor(value * multiplier) / multiplier;
+}
+
 // Domain numbering
 enum class Subdomain : unsigned int
 {
-    TISSUE = 1, BATH = 2
+    TISSUE = 1, BATH = 2, TORSO = 3, FIBROSIS = 0
 };
 // Time integrators
 enum class TimeIntegrator : unsigned int
@@ -178,8 +193,6 @@ double exact_solution_Ve(const libMesh::Point& p, const double time);
 double exact_solution_Ve_Vb(const libMesh::Point& p, const double time);
 void exact_solution_monolithic(libMesh::DenseVector<libMesh::Number>& output, const libMesh::Point& p, const double time);
 
-
-
 // Read mesh as specified in the input file
 void read_mesh(const GetPot &data, libMesh::ParallelMesh &mesh);
 // read BC sidesets from string: e.g. bc = "1 2 3 5", or bc = "1, 55, 2, 33"
@@ -203,7 +216,7 @@ void assemble_rhs(  libMesh::EquationSystems &es,
 void assemble_forcing_and_eval_error(libMesh::EquationSystems &es, const TimeData &timedata, TimeIntegrator time_integrator, libMesh::Order p_order, const GetPot &data, IonicModel& ionic_model, std::vector<double>& error );
 
 
-void ForcingTermConvergence(libMesh::EquationSystems &es, const double dt, const double Beta, const double Cm, const double SigmaSI, const double SigmaSE, const double SigmaBath, const double CurTime, const double xDim, const double v0, const double v1, const double v2, const double kcubic, const std::string integrator );
+void ForcingTermConvergence(libMesh::EquationSystems &es, const double dt, const double Beta, const double Cm, const double SigmaSI, const double SigmaSE, const double SigmaBath, const double SigmaTorso, const double CurTime, const double xDim, const double v0, const double v1, const double v2, const double kcubic, const std::string integrator );
 
 void init_cd_exact (EquationSystems & es, const double xDim, std::string integrator);
 
@@ -393,6 +406,7 @@ double CalculateF(const double x,
           const double SigmaSI,
           const double SigmaSE,
           const double SigmaBath,
+          const double SigmaTorso,
           const double xDim,
           const double v0,
           const double v1,
@@ -406,6 +420,8 @@ double CalculateF(const double x,
     //dt1 = alphaTime*(yDim/numEl)/(.125);
   //}
 
+  // 0 is for V, 1 for Ve, 2 is for Vbath in blood, 3 is for Vbath in torso
+  //USUALLY BLOOD BATH ON ONE SIDE OF THE TISSUE AND TORSO ON THE OTHER SIDE
 
   //V equation, parabolic, so Fv
   if(typeEqn == 0){
@@ -426,6 +442,9 @@ double CalculateF(const double x,
   else if(typeEqn == 2){
     value = -SigmaBath*exact_solutionV_all(x,y, 4004, time, 0.0, xDim)/Beta;
   }
+  else if(typeEqn == 3){
+      value = -SigmaTorso*exact_solutionV_all(x,y, 4004, time, 0.0, xDim)/Beta;
+    }
 
   return value;
 }
@@ -526,10 +545,13 @@ int main(int argc, char **argv)
     libMesh::EquationSystems es(mesh);
 
     // Define tissue active subdomain for subdomain restricted variables
-    std::set < libMesh::subdomain_id_type > tissue_subdomains;
+    std::set < libMesh::subdomain_id_type > tissue_subdomains, fibrosis_subdomains;
     tissue_subdomains.insert(static_cast<libMesh::subdomain_id_type>(Subdomain::TISSUE));
+    //fibrosis_subdomains.insert(static_cast<libMesh::subdomain_id_type>(Subdomain::FIBROSIS));
     // Define finite element ORDER
     int p_order = data("p_order", 1);
+    bool fibrosisBool = data("fibrosisBool", false);
+    std::string fibrosisMethod = data("fibrosisMethod","Conductivities");
     std::cout << "P order: " << p_order << std::endl;
     Order order = FIRST;
     if (p_order == 2)
@@ -548,13 +570,21 @@ int main(int argc, char **argv)
             libMesh::TransientLinearImplicitSystem & parabolic_system = es.add_system < libMesh::TransientLinearImplicitSystem > ("parabolic");
             TransientExplicitSystem & recovery = es.add_system <TransientExplicitSystem> ("Recovery");
 
+            //TransientExplicitSystem & fibrosis = es.add_system <TransientExplicitSystem> ("Fibrosis");
+
             std::cout << "Using element of order p = " << order << std::endl;
 
             if(convergence_test_save){
-				LinearImplicitSystem & solutionSystem = es.add_system <LinearImplicitSystem> ("Solution");
-				solutionSystem.add_variable("Ve_exact", order, LAGRANGE);
-				solutionSystem.add_variable("V_exact",order, LAGRANGE, &tissue_subdomains);
-			}
+                LinearImplicitSystem & solutionSystem = es.add_system <LinearImplicitSystem> ("Solution");
+                solutionSystem.add_variable("Ve_exact", order, LAGRANGE);
+                solutionSystem.add_variable("V_exact",order, LAGRANGE, &tissue_subdomains);
+            }
+
+            if(fibrosisBool && fibrosisMethod.compare(0,14,"Conductivities") == 0){
+            	LinearImplicitSystem & fibrosis_system = es.add_system <LinearImplicitSystem> ("Fibrosis");
+            	fibrosis_system.add_variable("Fibrosis_region",order, LAGRANGE, &tissue_subdomains);
+				parabolic_system.add_vector("Fibrosis_Check");
+            }
 
             parabolic_system.add_variable("V", order, LAGRANGE, &tissue_subdomains);
             elliptic_system.add_variable("Ve", order, LAGRANGE);
@@ -597,6 +627,12 @@ int main(int argc, char **argv)
                 solutionSystem.add_variable("Ve_exact", order, LAGRANGE);
                 solutionSystem.add_variable("V_exact",order, LAGRANGE, &tissue_subdomains);
             } 
+
+            if(fibrosisBool && fibrosisMethod.compare(0,14,"Conductivities") == 0){
+            	LinearImplicitSystem & fibrosis_system = es.add_system <LinearImplicitSystem> ("Fibrosis");
+				fibrosis_system.add_variable("Fibrosis_region",order, LAGRANGE, &tissue_subdomains);
+				fibrosis_system.add_vector("Fibrosis_Check");
+            }
 
             system.add_variable("V", order, LAGRANGE, &tissue_subdomains);
             system.add_variable("Ve", order, LAGRANGE);
@@ -655,7 +691,9 @@ int main(int argc, char **argv)
 
     // Start loop in time
 
-    double totalErrorInSpaceTimeV, totalErrorInSpaceTimeVe, totalErrorInSpaceTimeVb;
+    double totalErrorInSpaceTimeV = 0.;
+    double totalErrorInSpaceTimeVe = 0.;
+    double totalErrorInSpaceTimeVb = 0.;
     double xDim = data("maxx",1.) - data("minx", -1.);
 
     std::vector<double> error(3);
@@ -680,13 +718,15 @@ int main(int argc, char **argv)
                 {
                     assemble_matrices(es, datatime, time_integrator, order, data);
                     if(convergence_test){
-					   init_cd_exact(es, xDim, integrator);
-				   }
+                       init_cd_exact(es, xDim, integrator);
+                   }
                 }
                 libMesh::LinearImplicitSystem &elliptic_system = es.get_system < libMesh::LinearImplicitSystem > ("elliptic");
                 libMesh::TransientLinearImplicitSystem & parabolic_system = es.get_system < libMesh::TransientLinearImplicitSystem > ("parabolic");
+                //libMesh::TransientExplicitSystem & fibrosis_system = es.get_system < libMesh::TransientExplicitSystem > ("Fibrosis");
 
                 *parabolic_system.old_local_solution = *parabolic_system.solution;
+
                 //solve_ionic_model_evaluate_ionic_currents(es, ionic_model, pacing, datatime, time_integrator);
                 SolverRecovery (es, data, datatime);
                 // Solve Parabolic
@@ -711,14 +751,23 @@ int main(int argc, char **argv)
                     }
                 }
 
+
+
                 elliptic_system.solve();
                 elliptic_system.update();
+
+                //libMesh::out << "HERE" << std::endl;
+                if(fibrosisBool && datatime.timestep < 5 && fibrosisMethod.compare(0,14,"Conductivities") == 0){
+                	libMesh::LinearImplicitSystem &fibrosis_system = es.get_system < libMesh::LinearImplicitSystem > ("Fibrosis");
+                	*fibrosis_system.solution += parabolic_system.get_vector("Fibrosis_Check");
+                }
+
 
                 if(time_integrator == TimeIntegrator::SEMI_IMPLICIT_HALF_STEP)
                 {
                      // Solve Parabolic
                      assemble_rhs(es, datatime, time_integrator, order, data, EquationType::PARABOLIC);
-                     *parabolic_system.rhs -= parabolic_system.get_vector("ForcingV");
+                     //*parabolic_system.rhs -= parabolic_system.get_vector("ForcingV");
                      parabolic_system.solve();
                      parabolic_system.update();
                 }
@@ -765,6 +814,12 @@ int main(int argc, char **argv)
 
                 system.solve();
                 system.update();
+
+                if(fibrosisBool && datatime.timestep < 5 && fibrosisMethod.compare(0,14,"Conductivities") == 0){
+					libMesh::LinearImplicitSystem &fibrosis_system = es.get_system < libMesh::LinearImplicitSystem > ("Fibrosis");
+					*fibrosis_system.solution += fibrosis_system.get_vector("Fibrosis_Check");
+				}
+
                 break;
             }
             case TimeIntegrator::SBDF2:
@@ -808,6 +863,12 @@ int main(int argc, char **argv)
                 system.solve();
                 //system.solution->print();
                 system.update();
+
+                if(fibrosisBool && datatime.timestep < 5 && fibrosisMethod.compare(0,14,"Conductivities") == 0){
+					libMesh::LinearImplicitSystem &fibrosis_system = es.get_system < libMesh::LinearImplicitSystem > ("Fibrosis");
+					*fibrosis_system.solution += fibrosis_system.get_vector("Fibrosis_Check");
+				}
+
                 break;
             }
             case TimeIntegrator::SBDF1:
@@ -840,6 +901,12 @@ int main(int argc, char **argv)
 
                 system.solve();
                 system.update();
+
+                if(fibrosisBool && datatime.timestep < 5 && fibrosisMethod.compare(0,14,"Conductivities") == 0){
+					libMesh::LinearImplicitSystem &fibrosis_system = es.get_system < libMesh::LinearImplicitSystem > ("Fibrosis");
+					*fibrosis_system.solution += fibrosis_system.get_vector("Fibrosis_Check");
+				}
+
                 break;
             }
         }
@@ -859,11 +926,10 @@ int main(int argc, char **argv)
         }
 
         if (0 == datatime.timestep % 20)
-		{
-			std::cout << "At time: " << datatime.time << " ms: " << std::flush;
-			std::cout << "done " << std::endl;
-		}
-
+        {
+            std::cout << "At time: " << datatime.time << " ms: " << std::flush;
+            std::cout << "done " << std::endl;
+        }
 
 
 
@@ -884,124 +950,123 @@ int main(int argc, char **argv)
 
           if( time_integrator == TimeIntegrator::SBDF1 || time_integrator == TimeIntegrator::SBDF2 || time_integrator == TimeIntegrator::SBDF3 )
           {
-			  auto femSolu = es.get_system("bidomain").variable_number("V");
-			  auto femSolu2 = es.get_system("bidomain").variable_number("Ve");
-			  FEType fe_type = dof_map2.variable_type(femSolu);
-			  std::unique_ptr<FEBase> fe (FEBase::build(dim, fe_type));
-			  QGauss qrule (dim, FIFTH);
-			  // Tell the finite element object to use our quadrature rule.
-			  fe->attach_quadrature_rule (&qrule);
-			  const std::vector<Point> & q_point = fe->get_xyz();
-			  const std::vector<Real> & JxW = fe->get_JxW();
-			  const std::vector<std::vector<Real>> & phi = fe->get_phi();
+              auto femSolu = es.get_system("bidomain").variable_number("V");
+              auto femSolu2 = es.get_system("bidomain").variable_number("Ve");
+              FEType fe_type = dof_map2.variable_type(femSolu);
+              std::unique_ptr<FEBase> fe (FEBase::build(dim, fe_type));
+              QGauss qrule (dim, FIFTH);
+              // Tell the finite element object to use our quadrature rule.
+              fe->attach_quadrature_rule (&qrule);
+              const std::vector<Point> & q_point = fe->get_xyz();
+              const std::vector<Real> & JxW = fe->get_JxW();
+              const std::vector<std::vector<Real>> & phi = fe->get_phi();
 
-			  for(const auto & elem : mesh.active_local_element_ptr_range()){
+              for(const auto & elem : mesh.active_local_element_ptr_range()){
 
-			  fe->reinit (elem);
+              fe->reinit (elem);
 
-			  for (unsigned int qp=0; qp<qrule.n_points(); qp++){
+              for (unsigned int qp=0; qp<qrule.n_points(); qp++){
 
-					if(elem -> subdomain_id() == 1){
-					  u_h = es.get_system("bidomain").point_value(femSolu, q_point[qp], elem);
-					  u_exact = exact_solutionV_all(q_point[qp](0), q_point[qp](1), 2, datatime.time, 0.0, xDim);
-					  ue_h = es.get_system("bidomain").point_value(femSolu2, q_point[qp], elem);
-					  ue_exact = exact_solutionV_all(q_point[qp](0),q_point[qp](1), 3, datatime.time, 0.0, xDim);
-					  ub_h = 0.;
-					  ub_exact = 0.;
+                    if(elem -> subdomain_id() == 1){
+                      u_h = es.get_system("bidomain").point_value(femSolu, q_point[qp], elem);
+                      u_exact = exact_solutionV_all(q_point[qp](0), q_point[qp](1), 2, datatime.time, 0.0, xDim);
+                      ue_h = es.get_system("bidomain").point_value(femSolu2, q_point[qp], elem);
+                      ue_exact = exact_solutionV_all(q_point[qp](0),q_point[qp](1), 3, datatime.time, 0.0, xDim);
+                      ub_h = 0.;
+                      ub_exact = 0.;
 
-					  //equation_systems.get_system("Bidomain").point_value(femSoluV_exact, q_point[qp], elem) = u_exact;
-					  //equation_systems.get_system("Bidomain").point_value(femSoluVe_exact, q_point[qp], elem) = ue_exact;
+                      //equation_systems.get_system("Bidomain").point_value(femSoluV_exact, q_point[qp], elem) = u_exact;
+                      //equation_systems.get_system("Bidomain").point_value(femSoluVe_exact, q_point[qp], elem) = ue_exact;
 
-					}
-					else{
-					  u_h = 0.;
-					  u_exact = 0.;
-					  ue_h = 0.;
-					  ue_exact = 0.;
-					  ub_h = es.get_system("bidomain").point_value(femSolu2, q_point[qp], elem);
-					  ub_exact = exact_solutionV_all(q_point[qp](0),q_point[qp](1), 4, datatime.time, 0.0, xDim);
+                    }
+                    else{
+                      u_h = 0.;
+                      u_exact = 0.;
+                      ue_h = 0.;
+                      ue_exact = 0.;
+                      ub_h = es.get_system("bidomain").point_value(femSolu2, q_point[qp], elem);
+                      ub_exact = exact_solutionV_all(q_point[qp](0),q_point[qp](1), 4, datatime.time, 0.0, xDim);
 
-					  //equation_systems.get_system("Bidomain").point_value(femSoluVe_exact, q_point[qp], elem) = ue_exact;
-					}
+                      //equation_systems.get_system("Bidomain").point_value(femSoluVe_exact, q_point[qp], elem) = ue_exact;
+                    }
 
 
-					totalErrorInSpaceV += JxW[qp]*((u_h - u_exact)*(u_h - u_exact));
-					totalErrorInSpaceVe += JxW[qp]*((ue_h - ue_exact)*(ue_h - ue_exact));
-					totalErrorInSpaceVb += JxW[qp]*((ub_h - ub_exact)*(ub_h - ub_exact));
-					//rowsn = double(elem);
-					//colsn = qp;
-					//cout << qp << '\n';
+                    totalErrorInSpaceV += JxW[qp]*((u_h - u_exact)*(u_h - u_exact));
+                    totalErrorInSpaceVe += JxW[qp]*((ue_h - ue_exact)*(ue_h - ue_exact));
+                    totalErrorInSpaceVb += JxW[qp]*((ub_h - ub_exact)*(ub_h - ub_exact));
+                    //rowsn = double(elem);
+                    //colsn = qp;
+                    //cout << qp << '\n';
 
-					//if(qp == 0){
-					  //rowsn = rowsn + 1;
-					  //cout << 'this is rows: ' << rowsn << '\n';
-					//}
+                    //if(qp == 0){
+                      //rowsn = rowsn + 1;
+                      //cout << 'this is rows: ' << rowsn << '\n';
+                    //}
 
-					//cout << 'element: ' << elem << ' with qp: ' << q_point[qp] << endl;
-					//cout << typeof(elem).name() << endl;
-				  }
+                    //cout << 'element: ' << elem << ' with qp: ' << q_point[qp] << endl;
+                    //cout << typeof(elem).name() << endl;
+                  }
 
-			  }
+              }
            }
           else{
-			  auto femSolu = es.get_system("parabolic").variable_number("V");
-			  auto femSolu2 = es.get_system("elliptic").variable_number("Ve");
-			  FEType fe_type = dof_map2.variable_type(femSolu);
-			  std::unique_ptr<FEBase> fe (FEBase::build(dim, fe_type));
-			  QGauss qrule (dim, FIFTH);
-			  // Tell the finite element object to use our quadrature rule.
-			  fe->attach_quadrature_rule (&qrule);
-			  const std::vector<Point> & q_point = fe->get_xyz();
-			  const std::vector<Real> & JxW = fe->get_JxW();
-			  const std::vector<std::vector<Real>> & phi = fe->get_phi();
+              auto femSolu = es.get_system("parabolic").variable_number("V");
+              auto femSolu2 = es.get_system("elliptic").variable_number("Ve");
+              FEType fe_type = dof_map2.variable_type(femSolu);
+              std::unique_ptr<FEBase> fe (FEBase::build(dim, fe_type));
+              QGauss qrule (dim, FIFTH);
+              // Tell the finite element object to use our quadrature rule.
+              fe->attach_quadrature_rule (&qrule);
+              const std::vector<Point> & q_point = fe->get_xyz();
+              const std::vector<Real> & JxW = fe->get_JxW();
+              const std::vector<std::vector<Real>> & phi = fe->get_phi();
 
-			  for(const auto & elem : mesh.active_local_element_ptr_range()){
+              for(const auto & elem : mesh.active_local_element_ptr_range()){
 
-			  fe->reinit (elem);
+              fe->reinit (elem);
 
-			  for (unsigned int qp=0; qp<qrule.n_points(); qp++){
+              for (unsigned int qp=0; qp<qrule.n_points(); qp++){
 
-					if(elem -> subdomain_id() == 1){
-					  u_h = es.get_system("parabolic").point_value(femSolu, q_point[qp], elem);
-					  u_exact = exact_solutionV_all(q_point[qp](0), q_point[qp](1), 2, datatime.time, 0.0, xDim);
-					  ue_h = es.get_system("elliptic").point_value(femSolu2, q_point[qp], elem);
-					  ue_exact = exact_solutionV_all(q_point[qp](0),q_point[qp](1), 3, datatime.time, 0.0, xDim);
-					  ub_h = 0.;
-					  ub_exact = 0.;
+                    if(elem -> subdomain_id() == 1){
+                      u_h = es.get_system("parabolic").point_value(femSolu, q_point[qp], elem);
+                      u_exact = exact_solutionV_all(q_point[qp](0), q_point[qp](1), 2, datatime.time, 0.0, xDim);
+                      ue_h = es.get_system("elliptic").point_value(femSolu2, q_point[qp], elem);
+                      ue_exact = exact_solutionV_all(q_point[qp](0),q_point[qp](1), 3, datatime.time, 0.0, xDim);
+                      ub_h = 0.;
+                      ub_exact = 0.;
 
-					  //equation_systems.get_system("Bidomain").point_value(femSoluV_exact, q_point[qp], elem) = u_exact;
-					  //equation_systems.get_system("Bidomain").point_value(femSoluVe_exact, q_point[qp], elem) = ue_exact;
+                      //equation_systems.get_system("Bidomain").point_value(femSoluV_exact, q_point[qp], elem) = u_exact;
+                      //equation_systems.get_system("Bidomain").point_value(femSoluVe_exact, q_point[qp], elem) = ue_exact;
 
-					}
-					else{
-					  u_h = 0.;
-					  u_exact = 0.;
-					  ue_h = 0.;
-					  ue_exact = 0.;
-					  ub_h = es.get_system("elliptic").point_value(femSolu2, q_point[qp], elem);
-					  ub_exact = exact_solutionV_all(q_point[qp](0),q_point[qp](1), 4, datatime.time, 0.0, xDim);
+                    }
+                    else{
+                      u_h = 0.;
+                      u_exact = 0.;
+                      ue_h = 0.;
+                      ue_exact = 0.;
+                      ub_h = es.get_system("elliptic").point_value(femSolu2, q_point[qp], elem);
+                      ub_exact = exact_solutionV_all(q_point[qp](0),q_point[qp](1), 4, datatime.time, 0.0, xDim);
 
-					  //equation_systems.get_system("Bidomain").point_value(femSoluVe_exact, q_point[qp], elem) = ue_exact;
-					}
+                      //equation_systems.get_system("Bidomain").point_value(femSoluVe_exact, q_point[qp], elem) = ue_exact;
+                    }
 
+                    totalErrorInSpaceV += JxW[qp]*((u_h - u_exact)*(u_h - u_exact));
+                    totalErrorInSpaceVe += JxW[qp]*((ue_h - ue_exact)*(ue_h - ue_exact));
+                    totalErrorInSpaceVb += JxW[qp]*((ub_h - ub_exact)*(ub_h - ub_exact));
+                    //rowsn = double(elem);
+                    //colsn = qp;
+                    //cout << qp << '\n';
 
-					totalErrorInSpaceV += JxW[qp]*((u_h - u_exact)*(u_h - u_exact));
-					totalErrorInSpaceVe += JxW[qp]*((ue_h - ue_exact)*(ue_h - ue_exact));
-					totalErrorInSpaceVb += JxW[qp]*((ub_h - ub_exact)*(ub_h - ub_exact));
-					//rowsn = double(elem);
-					//colsn = qp;
-					//cout << qp << '\n';
+                    //if(qp == 0){
+                      //rowsn = rowsn + 1;
+                      //cout << 'this is rows: ' << rowsn << '\n';
+                    //}
 
-					//if(qp == 0){
-					  //rowsn = rowsn + 1;
-					  //cout << 'this is rows: ' << rowsn << '\n';
-					//}
+                    //cout << 'element: ' << elem << ' with qp: ' << q_point[qp] << endl;
+                    //cout << typeof(elem).name() << endl;
+                  }
 
-					//cout << 'element: ' << elem << ' with qp: ' << q_point[qp] << endl;
-					//cout << typeof(elem).name() << endl;
-				  }
-
-			  }
+              }
            }
 
 
@@ -1014,37 +1079,39 @@ int main(int argc, char **argv)
       libMesh::out << "The L2 norm for Ve in space is: " << std::sqrt(totalErrorInSpaceVe)<< std::endl;
       libMesh::out << "The L2 norm for Vb in space is: " << std::sqrt(totalErrorInSpaceVb)<< std::endl;
 
+      //libMesh::out << "The CUMULATIVE L2 norm for V in space and time is: " << (totalErrorInSpaceTimeV)<< std::endl;
+
       //START OF SAVING SOLUTION SYSTEM
-		if(convergence_test_save){
-		  auto femSoluV_exact = es.get_system("Solution").variable_number("V_exact");
-		  auto femSoluVe_exact = es.get_system("Solution").variable_number("Ve_exact");
+        if(convergence_test_save){
+          auto femSoluV_exact = es.get_system("Solution").variable_number("V_exact");
+          auto femSoluVe_exact = es.get_system("Solution").variable_number("Ve_exact");
 
-		  const DofMap & dof_map = es.get_system("Solution").get_dof_map();
+          const DofMap & dof_map = es.get_system("Solution").get_dof_map();
 
-		  for(const auto & node : mesh.local_node_ptr_range()){
+          for(const auto & node : mesh.local_node_ptr_range()){
 
-			dof_map.dof_indices (node, dof_indices);
-			dof_map2.dof_indices (node, dof_indices2);
+            dof_map.dof_indices (node, dof_indices);
+            dof_map2.dof_indices (node, dof_indices2);
 
-			const Real x = (*node)(0);
-			const Real y = (*node)(1);
+            const Real x = (*node)(0);
+            const Real y = (*node)(1);
 
-			if(dof_indices2.size() > 0){
+            if(dof_indices2.size() > 0){
 
-			u_exact = exact_solutionV_all(x, y, 2, datatime.time, 0.0, xDim);
-			es.get_system("Solution").solution -> set(dof_indices[femSoluV_exact],u_exact);
-			ue_exact = exact_solutionV_all(x, y, 3, datatime.time, 0.0, xDim);
-			es.get_system("Solution").solution -> set(dof_indices[femSoluVe_exact],ue_exact);
+            u_exact = exact_solutionV_all(x, y, 2, datatime.time, 0.0, xDim);
+            es.get_system("Solution").solution -> set(dof_indices[femSoluV_exact],u_exact);
+            ue_exact = exact_solutionV_all(x, y, 3, datatime.time, 0.0, xDim);
+            es.get_system("Solution").solution -> set(dof_indices[femSoluVe_exact],ue_exact);
 
-			}
-			else{
-			ue_exact = exact_solutionV_all(x, y, 4, datatime.time, 0.0, xDim);
-			es.get_system("Solution").solution -> set(dof_indices[femSoluVe_exact],ue_exact);
-			}
+            }
+            else{
+            ue_exact = exact_solutionV_all(x, y, 4, datatime.time, 0.0, xDim);
+            es.get_system("Solution").solution -> set(dof_indices[femSoluVe_exact],ue_exact);
+            }
 
-		  }
-		}
-		//END OF SAVING SOLUTION SYSTEM
+          }
+        }
+        //END OF SAVING SOLUTION SYSTEM
 
     }
     //END OF ERROR CALCULATION
@@ -1082,6 +1149,8 @@ int main(int argc, char **argv)
     return 0;
 }
 
+
+
 void read_mesh(const GetPot &data, libMesh::ParallelMesh &mesh)
 {
     using namespace libMesh;
@@ -1105,10 +1174,103 @@ void read_mesh(const GetPot &data, libMesh::ParallelMesh &mesh)
         double maxx = data("maxx", 1.0);
         double maxy = data("maxy", 1.0);
         double maxz = data("maxz", 1.0);
-
         double minx = data("minx", 0.0);
         double miny = data("miny", 0.0);
         double minz = data("minz", 0.0);
+        bool fibrosisBool = data("fibrosisBool", false);
+        std::string fibrosisMethod = data("fibrosisMethod","Conductivities");
+
+
+    	vector<std::string> fibrosis_coords2;
+    	//vector<std::string> tissue_coords2;
+
+    	if(fibrosisBool && fibrosisMethod.compare(0,11,"Percolation") == 0){
+    	  std::string fibrosis_coords_matrix = data("fibrosis_coords_matrix", "fibrosisCoords.csv");
+    	  //std::string tissue_coords_matrix = data("tissue_coords_matrix", "tissueCoords.csv");
+
+    	  std::string line, word;
+    	  //vector<double> local_row;
+    	  fstream file (fibrosis_coords_matrix, ios::in);
+    	  //fstream file2 (tissue_coords_matrix, ios::in);
+
+    	  //PULLING FIBROSIS COORDINATES INTO VECTOR
+    	  if(file.is_open())
+    	  {
+    		while(getline(file, line))
+    		{
+    		  //local_row.clear();
+
+    		  stringstream str(line);
+
+    		  //fibrosis_coords2[counterLine] = line;
+    		  fibrosis_coords2.push_back(line);
+
+    		  //while(getline(str, word, ',')){
+    			//local_row.push_back(std::stod(word));
+    		  //}
+    		  //fibrosis_coords.push_back(local_row);
+    		}
+    		libMesh::out << "Fibrosis case: File: " << fibrosis_coords_matrix << " found successfully... Eliminating elements from tissue domain..." << std::endl;
+    		libMesh::out << "Fibrosis method used: " << fibrosisMethod << std::endl;
+    	  }
+    	  else{
+    		libMesh::out << "Could not open the file" << std::endl;
+    	  }
+    	  /*
+    	  //PULLING TISSUE COORDINATES INTO VECTOR
+    	  if(file2.is_open())
+    	  {
+    		while(getline(file2, line))
+    		{
+    		  local_row.clear();
+
+    		  stringstream str(line);
+
+    		  tissue_coords2.push_back(line);
+
+    		  while(getline(str, word, ',')){
+    			local_row.push_back(std::stod(word));
+    		  }
+    		  tissue_coords.push_back(local_row);
+    		}
+    	  }
+    	  else{
+    		libMesh::out << "Could not open the file" << std::endl;
+    	  }
+
+    	  libMesh::out << "FIBROTIC COORDINATES" << std::endl;
+    	  for(int i=0;i<fibrosis_coords.size();i++)
+    	  {
+    		for(int j=0;j<fibrosis_coords[i].size();j++)
+    		{
+    		  libMesh::out << fibrosis_coords[i][j] << " ";
+    		}
+    		libMesh::out << std::endl;
+    	  }
+
+    	  libMesh::out << "TISSUE COORDINATES" << std::endl;
+    	  for(int i=0;i<tissue_coords.size();i++)
+    	  {
+    		for(int j=0;j<tissue_coords[i].size();j++)
+    		{
+    		  libMesh::out << tissue_coords[i][j] << " ";
+    		}
+    		libMesh::out << std::endl;
+    	  }
+
+    	  libMesh::out << "CHECK CHECK CHECK" << std::endl;
+    	  for(int i=0;i<fibrosis_coords2.size();i++)
+    	  {
+    		libMesh::out << fibrosis_coords2[i] << std::endl;
+    	  }
+    	  */
+
+    	}
+
+
+
+
+        bool convergence_test = data("convergence_test", false);
 
         // Get mesh parameters
         std::string eltype = data("eltype", "simplex");
@@ -1149,16 +1311,80 @@ void read_mesh(const GetPot &data, libMesh::ParallelMesh &mesh)
             // Are we in the tissue region?
             if (box.contains_point(c))
             {
-                el->subdomain_id() = static_cast<libMesh::subdomain_id_type>(Subdomain::TISSUE);
+            	if(fibrosisBool && fibrosisMethod.compare(0,11,"Percolation") == 0){
+
+					  double x = c(0);
+					  double y = c(1);
+					  double z = c(2);
+
+					  //libMesh::out << std::fixed;
+					  //libMesh::out << std::setprecision(4);
+
+					  std::string check_Presence;
+
+					  if(nelz == 0){
+						  check_Presence = to_string(round_up(x,8))+","+to_string(round_up(y,8));
+					  }
+					  else{
+						  check_Presence = to_string(round_up(x,8))+","+to_string(round_up(y,8))+","+to_string(round_up(z,8));
+					  }
+
+					  auto icheck = std::find(fibrosis_coords2.begin(), fibrosis_coords2.end(), check_Presence);
+					  //libMesh::out << check_Presence << std::endl;
+					  //libMesh::out << x << "," << y << "," << z << std::endl;
+					  if(fibrosis_coords2.end() != icheck){
+						//libMesh::out << "Found     " << check_Presence << "    at row " << " col " << icheck-fibrosis_coords2.begin() << '\n';
+						el->subdomain_id() = static_cast<libMesh::subdomain_id_type>(Subdomain::FIBROSIS);
+					  }
+					  else{
+						el->subdomain_id() = static_cast<libMesh::subdomain_id_type>(Subdomain::TISSUE);
+					  }
+
+            	}
+            	else{
+            		  el->subdomain_id() = static_cast<libMesh::subdomain_id_type>(Subdomain::TISSUE);
+            		//libMesh::out << "x: " << c(0) << "          y: " << c(1) << std::endl;
+            	}
             }
             // we are not
             else
             {
-                el->subdomain_id() = static_cast<libMesh::subdomain_id_type>(Subdomain::BATH);
+                if(convergence_test){
+                    el->subdomain_id() = static_cast<libMesh::subdomain_id_type>(Subdomain::BATH);
+                }
+                else{
+                    double x = c(0);
+                    double y = c(1);
+                    double z = c(2);
+
+                    //libMesh::out << "x: " << x << "          y: " << y << "         z: " << z << std::endl;
+                    //DEPENDENT ON WHETHER 3D OR 2D
+                    //2D case
+                    if(nelz == 0){
+                        if(y > tissue_maxy){
+                            el->subdomain_id() = static_cast<libMesh::subdomain_id_type>(Subdomain::BATH);
+                            //libMesh::out << "x: " << x << "          y: " << y << "         z: " << z << std::endl;
+                        }
+                        else if(y < tissue_miny){
+                            el->subdomain_id() = static_cast<libMesh::subdomain_id_type>(Subdomain::TORSO);
+                            //libMesh::out << "x: " << x << "          y: " << y << "         z: " << z << std::endl;
+                        }
+
+                    }
+                    else{
+                        if(z > tissue_maxz){
+                            el->subdomain_id() = static_cast<libMesh::subdomain_id_type>(Subdomain::BATH);
+                        }
+                        else if(z < tissue_minz){
+                            el->subdomain_id() = static_cast<libMesh::subdomain_id_type>(Subdomain::TORSO);
+                        }
+                    }
+                }
             }
         }
     }
 }
+
 
 // Initialize TimeData from input
 TimeData::TimeData(GetPot &data) :
@@ -1188,6 +1414,100 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
     std::set<int> bc_sidesets;
     std::string bcs = data("bcs", "");
     read_bc_list(bcs, bc_sidesets);
+
+    bool fibrosisBool = data("fibrosisBool", false);
+    std::string fibrosisMethod = data("fibrosisMethod","Conductivities");
+
+	//vector<vector<double>> fibrosis_coords;
+	//vector<vector<double>> tissue_coords;
+
+	vector<std::string> fibrosis_coords2;
+	//vector<std::string> tissue_coords2;
+
+	if(fibrosisBool && fibrosisMethod.compare(0,14,"Conductivities") == 0){
+	  std::string fibrosis_coords_matrix = data("fibrosis_coords_matrix", "fibrosisCoords.csv");
+	  //std::string tissue_coords_matrix = data("tissue_coords_matrix", "tissueCoords.csv");
+
+	  std::string line, word;
+	  //vector<double> local_row;
+	  fstream file (fibrosis_coords_matrix, ios::in);
+	  //fstream file2 (tissue_coords_matrix, ios::in);
+
+	  //PULLING FIBROSIS COORDINATES INTO VECTOR
+	  if(file.is_open())
+	  {
+		while(getline(file, line))
+		{
+		  //local_row.clear();
+
+		  stringstream str(line);
+
+		  //fibrosis_coords2[counterLine] = line;
+		  fibrosis_coords2.push_back(line);
+
+		  //while(getline(str, word, ',')){
+			//local_row.push_back(std::stod(word));
+		  //}
+		  //fibrosis_coords.push_back(local_row);
+		}
+
+		libMesh::out << "Fibrosis case: File: " << fibrosis_coords_matrix << " found successfully... Changing conductivities..." << std::endl;
+		libMesh::out << "Fibrosis method used: " << fibrosisMethod << std::endl;
+
+	  }
+	  else{
+		libMesh::out << "Could not open the file" << std::endl;
+	  }
+	  /*
+	  //PULLING TISSUE COORDINATES INTO VECTOR
+	  if(file2.is_open())
+	  {
+		while(getline(file2, line))
+		{
+		  local_row.clear();
+
+		  stringstream str(line);
+
+		  tissue_coords2.push_back(line);
+
+		  while(getline(str, word, ',')){
+			local_row.push_back(std::stod(word));
+		  }
+		  tissue_coords.push_back(local_row);
+		}
+	  }
+	  else{
+		libMesh::out << "Could not open the file" << std::endl;
+	  }
+
+	  libMesh::out << "FIBROTIC COORDINATES" << std::endl;
+	  for(int i=0;i<fibrosis_coords.size();i++)
+	  {
+		for(int j=0;j<fibrosis_coords[i].size();j++)
+		{
+		  libMesh::out << fibrosis_coords[i][j] << " ";
+		}
+		libMesh::out << std::endl;
+	  }
+
+	  libMesh::out << "TISSUE COORDINATES" << std::endl;
+	  for(int i=0;i<tissue_coords.size();i++)
+	  {
+		for(int j=0;j<tissue_coords[i].size();j++)
+		{
+		  libMesh::out << tissue_coords[i][j] << " ";
+		}
+		libMesh::out << std::endl;
+	  }
+
+	  libMesh::out << "CHECK CHECK CHECK" << std::endl;
+	  for(int i=0;i<fibrosis_coords2.size();i++)
+	  {
+		libMesh::out << fibrosis_coords2[i] << std::endl;
+	  }
+	  */
+	}
+
 
 
     const MeshBase &mesh = es.get_mesh();
@@ -1239,11 +1559,13 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
     double sigma_s_e = data("sigma_s_e", 1.0438);  // sigma_t in the paper
     double sigma_n_e = data("sigma_n_e", 0.37222);
     double sigma_b_ie = data("sigma_b", 6.0);
+    double sigma_torso_ie = data("sigma_torso", 6.0);
     double chi = data("chi", 1e3);
     double Cm = data("Cm", 1.5);
     double penalty = data("penalty", 1e8);
     double interface_penalty = data("interface_penalty", 1e4);
     double zDim = data("nelz",0);
+    double nelz = data("nelz",0);
     double stimulus_maxx = data("stimulus_maxx", .5);
     double stimulus_minx = data("stimulus_minx", -.5);
     double stimulus_maxy = data("stimulus_maxy", 1.5);
@@ -1263,11 +1585,13 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
     TensorValue<Number> sigma_i = ( sigma_f_i * fof + sigma_s_i * sos + sigma_n_i * non ) /chi;
     TensorValue<Number> sigma_e = ( sigma_f_e * fof + sigma_s_e * sos + sigma_n_e * non) / chi;
     TensorValue<Number> sigma_b(sigma_b_ie/chi, 0.0, 0.0, 0.0, sigma_b_ie/chi, 0.0, 0.0, 0.0, sigma_b_ie/chi);
+    TensorValue<Number> sigma_torso(sigma_torso_ie/chi, 0.0, 0.0, 0.0, sigma_torso_ie/chi, 0.0, 0.0, 0.0, sigma_torso_ie/chi);
 
     DenseMatrix < Number > K;
     DenseMatrix < Number > M;
     DenseVector < Number > M_lumped;
     DenseVector < Number > I_extra_stim;
+    DenseVector < Number > Fibrosis_CheckV;
 
     std::vector < dof_id_type > dof_indices;
     std::vector < dof_id_type > parabolic_dof_indices;
@@ -1304,9 +1628,9 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
             const DofMap & elliptic_dof_map = elliptic_system.get_dof_map();
             const DofMap & parabolic_dof_map = parabolic_system.get_dof_map();
 
-
             for (auto elem : mesh.element_ptr_range())
             {
+            	auto c = elem -> centroid();
                 parabolic_dof_map.dof_indices(elem, parabolic_dof_indices);
                 elliptic_dof_map.dof_indices(elem, elliptic_dof_indices);
                 fe->reinit(elem);
@@ -1322,13 +1646,18 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
                 S.resize(parabolic_ndofs, parabolic_ndofs);
                 I_extra_stim.resize (elliptic_dof_indices.size());
                 M_lumped.resize(parabolic_ndofs);
+                if(fibrosisMethod.compare(0,14,"Conductivities") == 0 && fibrosisBool){
+                	Fibrosis_CheckV.resize(parabolic_ndofs);
+                }
+
+
 
                 auto subdomain_id = elem->subdomain_id();
 
                 //std::cout << "Loop over volume: " << std::flush;
 
                 // if we are in the bath
-                if (subdomain_id == static_cast<short unsigned int>(Subdomain::BATH))
+                if (subdomain_id == static_cast<short unsigned int>(Subdomain::BATH) || subdomain_id == static_cast<short unsigned int>(Subdomain::TORSO))
                 {
                     for (unsigned int qp = 0; qp < qrule.n_points(); qp++)
                     {
@@ -1340,8 +1669,12 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
                         {
                             for (unsigned int j = 0; j != elliptic_ndofs; j++)
                             {
-                                K(i, j) += JxW[qp] * dphi[i][qp] * (sigma_b * dphi[j][qp]);
-
+                                if(subdomain_id == static_cast<short unsigned int>(Subdomain::BATH)){
+                                    K(i, j) += JxW[qp] * dphi[i][qp] * (sigma_b * dphi[j][qp]);
+                                }
+                                else if(subdomain_id == static_cast<short unsigned int>(Subdomain::TORSO)){
+                                    K(i, j) += JxW[qp] * dphi[i][qp] * (sigma_torso * dphi[j][qp]);
+                                }
 
 
                                 if(zDim == 0){
@@ -1368,30 +1701,87 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
                         }
                     }
                 }
-                else
+                else if(subdomain_id == static_cast<short unsigned int>(Subdomain::TISSUE))
                 {
+
+
                     for (unsigned int qp = 0; qp < qrule.n_points(); qp++)
                     {
-                        for (unsigned int i = 0; i != elliptic_ndofs; i++)
+                        for (unsigned int i = 0; i != parabolic_ndofs; i++)
                         {
-                            for (unsigned int j = 0; j != elliptic_ndofs; j++)
+                            for (unsigned int j = 0; j != parabolic_ndofs; j++)
                             {
+                            	double factorDiv = 1.;
+                            	auto locSigma_i = sigma_i;
+                            	auto locSigma_e = sigma_e;
+                            	if(fibrosisBool && fibrosisMethod.compare(0,14,"Conductivities") == 0){
+
+								  double x = c(0);
+								  double y = c(1);
+								  double z = c(2);
+
+								  //libMesh::out << std::fixed;
+								  //libMesh::out << std::setprecision(4);
+
+								  std::string check_Presence;
+
+								  if(nelz == 0){
+									  check_Presence = to_string(round_up(x,8))+","+to_string(round_up(y,8));
+								  }
+								  else{
+									  check_Presence = to_string(round_up(x,8))+","+to_string(round_up(y,8))+","+to_string(round_up(z,8));
+								  }
+
+								  auto icheck = std::find(fibrosis_coords2.begin(), fibrosis_coords2.end(), check_Presence);
+								  //libMesh::out << check_Presence << std::endl;
+								  if(fibrosis_coords2.end() != icheck){
+									//libMesh::out << "Found     " << check_Presence << "    at row " << " col " << i-fibrosis_coords2.begin() << '\n';
+									//el->subdomain_id() = static_cast<libMesh::subdomain_id_type>(Subdomain::FIBROSIS);
+
+									  factorDiv = 10000000000000000000000000.;
+									  Fibrosis_CheckV(i) += JxW[qp]*(     phi[i][qp]*phi[j][qp]*((10./1.)*IstimV)     );
+
+									  //locSigma_e = ( 0. * fof + 0. * sos + 0. * non ) /chi;
+									  //locSigma_i = ( 0. * fof + 0. * sos + 0. * non ) /chi;
+
+								  }
+								  else{
+									//el->subdomain_id() = static_cast<libMesh::subdomain_id_type>(Subdomain::TISSUE);
+									  //Fibrosis_CheckV(i) += JxW[qp]*(     0.    );
+								  }
+								}
+
                                 // Elliptic equation matrix
-                                K(i, j) += JxW[qp] * dphi[i][qp] * ((sigma_i + sigma_e) * dphi[j][qp]);
+                                K(i, j) += JxW[qp] * dphi[i][qp] * (((sigma_i + sigma_e)/factorDiv) * dphi[j][qp]);
 
                                 // Parabolic matrices
                                 // add mass matrix
                                 M_lumped(i) += JxW[qp] * Cm / timedata.dt * phi[i][qp] * phi[j][qp];
                                 // stiffness matrix
-                                Ki(i, j) += JxW[qp] * dphi[i][qp] * ((sigma_i) * dphi[j][qp]);
-                                Ke(i, j) += JxW[qp] * dphi[i][qp] * ((sigma_e) * dphi[j][qp]);
+                                Ki(i, j) += JxW[qp] * dphi[i][qp] * ((sigma_i/factorDiv) * dphi[j][qp]);
+                                Ke(i, j) += JxW[qp] * dphi[i][qp] * ((sigma_e/factorDiv) * dphi[j][qp]);
                                 M(i,  j) += JxW[qp] * phi[i][qp] * phi[j][qp];
-                                S(i, j)  += JxW[qp] * dphi[i][qp] * ((sigma_i) * dphi[j][qp]);
+                                S(i, j)  += JxW[qp] * dphi[i][qp] * ((sigma_i/factorDiv) * dphi[j][qp]);
                                 S(i, i)  += JxW[qp] * Cm / timedata.dt * phi[i][qp] * phi[j][qp];
                             }
                         }
                     }
                 }
+                else if(subdomain_id == static_cast<short unsigned int>(Subdomain::FIBROSIS))
+				{
+					for (unsigned int qp = 0; qp < qrule.n_points(); qp++)
+					{
+						for (unsigned int i = 0; i != elliptic_ndofs; i++)
+						{
+							for (unsigned int j = 0; j != elliptic_ndofs; j++)
+							{
+								// Elliptic equation matrix
+								//Fibrosis_CheckV(i) += JxW[qp]*(     phi[i][qp]*phi[j][qp]*((10./1.)*IstimV)     );
+								K(i, j) += JxW[qp] * dphi[i][qp] * (((sigma_i + sigma_e)) * dphi[j][qp]);
+							}
+						}
+					}
+				}
                 //std::cout << ", Loop over interface: " << std::flush;
 
                 // interface
@@ -1426,7 +1816,7 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
                 }
                 // boundaries
                 //std::cout << ", Loop over boundaries: " << std::flush;
-                if (subdomain_id == static_cast<libMesh::subdomain_id_type>(Subdomain::BATH))
+                if (subdomain_id == static_cast<libMesh::subdomain_id_type>(Subdomain::BATH) || subdomain_id == static_cast<libMesh::subdomain_id_type>(Subdomain::TORSO))
                 {
                     for (auto side : elem->side_index_range())
                     {
@@ -1458,6 +1848,9 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
                 parabolic_system.matrix->add_matrix(S, parabolic_dof_indices, parabolic_dof_indices);
                 parabolic_system.get_matrix("M").add_matrix(M, parabolic_dof_indices, parabolic_dof_indices);
                 parabolic_system.get_vector("ML").add_vector(M_lumped, parabolic_dof_indices);
+                if(fibrosisBool && fibrosisMethod.compare(0,14,"Conductivities") == 0){
+                	parabolic_system.get_vector("Fibrosis_Check").add_vector(Fibrosis_CheckV, parabolic_dof_indices);
+                }
                 parabolic_system.get_matrix("Ki").add_matrix(Ki, parabolic_dof_indices, parabolic_dof_indices);
                 parabolic_system.get_matrix("Ke").add_matrix(Ke, parabolic_dof_indices, parabolic_dof_indices);
                 parabolic_system.get_matrix("Kg").add_matrix(Kg, parabolic_dof_indices, parabolic_dof_indices);
@@ -1466,6 +1859,9 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
             std::cout << "closing" << std::endl;
             elliptic_system.matrix->close();
             elliptic_system.get_vector("I_extra_stim").close();
+            if(fibrosisBool && fibrosisMethod.compare(0,14,"Conductivities") == 0){
+            	parabolic_system.get_vector("Fibrosis_Check").close();
+            }
             parabolic_system.matrix->close();
             parabolic_system.get_matrix("M").close();
             parabolic_system.get_vector("ML").close();
@@ -1522,6 +1918,7 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
 
             for (auto elem : mesh.element_ptr_range())
             {
+            	auto c = elem -> centroid();
                 dof_map.dof_indices(elem, dof_indices);
                 dof_map.dof_indices(elem, parabolic_dof_indices, V_var_number);
                 dof_map.dof_indices(elem, elliptic_dof_indices, Ve_var_number);
@@ -1536,6 +1933,9 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
                 M.resize(ndofs, ndofs);
                 M_lumped.resize(ndofs);
                 I_extra_stim.resize (ndofs);
+                if(fibrosisMethod.compare(0,14,"Conductivities") == 0 && fibrosisBool){
+                	Fibrosis_CheckV.resize(parabolic_ndofs);
+                }
 
                 // reposition submatrices
                 // Reposition the submatrices...  The idea is this:
@@ -1550,12 +1950,13 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
                 KVVe.reposition(V_var_number * parabolic_ndofs, Ve_var_number * parabolic_ndofs, parabolic_ndofs, elliptic_ndofs);
                 KVeV.reposition(Ve_var_number * elliptic_ndofs, V_var_number * elliptic_ndofs, elliptic_ndofs, parabolic_ndofs);
                 KVeVe.reposition(Ve_var_number * elliptic_ndofs, Ve_var_number * elliptic_ndofs, elliptic_ndofs, elliptic_ndofs);
+
                 MVV.reposition(V_var_number * parabolic_ndofs, V_var_number * parabolic_ndofs, parabolic_ndofs, parabolic_ndofs);
                 ML.reposition(V_var_number * parabolic_ndofs, parabolic_ndofs);
 
                 auto subdomain_id = elem->subdomain_id();
                 // if we are in the bath
-                if (subdomain_id == static_cast<short unsigned int>(Subdomain::BATH))
+                if (subdomain_id == static_cast<short unsigned int>(Subdomain::BATH) || subdomain_id == static_cast<short unsigned int>(Subdomain::TORSO))
                 {
                     for (unsigned int qp = 0; qp < qrule.n_points(); qp++)
                     {
@@ -1568,7 +1969,13 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
                         {
                             for (unsigned int j = 0; j != elliptic_ndofs; j++)
                             {
-                                K(i, j) += JxW[qp] * dphi[i][qp] * (sigma_b * dphi[j][qp]);
+                                if(subdomain_id == static_cast<short unsigned int>(Subdomain::BATH)){
+                                    K(i, j) += JxW[qp] * dphi[i][qp] * (sigma_b * dphi[j][qp]);
+                                }
+                                else if(subdomain_id == static_cast<short unsigned int>(Subdomain::TORSO)){
+                                    K(i, j) += JxW[qp] * dphi[i][qp] * (sigma_torso * dphi[j][qp]);
+                                }
+
 
 
                                 if(zDim == 0){
@@ -1595,14 +2002,50 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
                         }
                     }
                 }
-                else
+                else if(subdomain_id == static_cast<short unsigned int>(Subdomain::TISSUE))
                 {
                     for (unsigned int qp = 0; qp < qrule.n_points(); qp++)
                     {
-                        for (unsigned int i = 0; i != elliptic_ndofs; i++)
+
+                        for (unsigned int i = 0; i != parabolic_ndofs; i++)
                         {
-                            for (unsigned int j = 0; j != elliptic_ndofs; j++)
+                            for (unsigned int j = 0; j != parabolic_ndofs; j++)
                             {
+                            	double factorDiv = 1.;
+								if(fibrosisBool && fibrosisMethod.compare(0,14,"Conductivities") == 0){
+
+								  double x = c(0);
+								  double y = c(1);
+								  double z = c(2);
+
+								  //libMesh::out << std::fixed;
+								  //libMesh::out << std::setprecision(4);
+
+								  std::string check_Presence;
+
+								  if(nelz == 0){
+									  check_Presence = to_string(round_up(x,8))+","+to_string(round_up(y,8));
+								  }
+								  else{
+									  check_Presence = to_string(round_up(x,8))+","+to_string(round_up(y,8))+","+to_string(round_up(z,8));
+								  }
+
+								  auto icheck = std::find(fibrosis_coords2.begin(), fibrosis_coords2.end(), check_Presence);
+								  //libMesh::out << check_Presence << std::endl;
+								  if(fibrosis_coords2.end() != icheck){
+									//libMesh::out << "Found     " << check_Presence << "    at row " << " col " << i-fibrosis_coords2.begin() << '\n';
+									//el->subdomain_id() = static_cast<libMesh::subdomain_id_type>(Subdomain::FIBROSIS);
+
+									  factorDiv = 1000000000000000.;
+									  Fibrosis_CheckV(i) += JxW[qp]*(     phi[i][qp]*phi[j][qp]*((1./1.)*IstimV)     );
+
+								  }
+								  else{
+									//el->subdomain_id() = static_cast<libMesh::subdomain_id_type>(Subdomain::TISSUE);
+									  //Fibrosis_CheckV(i) += JxW[qp]*(    0.     );
+								  }
+								}
+
                                 // add mass matrix
                                 if (p_order == SECOND) // we cannot do the lumping
                                     KVV(i, j) += JxW[qp] * coefficient * phi[i][qp] * phi[j][qp];
@@ -1611,10 +2054,10 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
                                     KVV(i, i) += JxW[qp] * coefficient * phi[i][qp] * phi[j][qp];
 
                                 // stiffness matrix
-                                KVV(i, j) += JxW[qp] * dphi[i][qp] * ((sigma_i) * dphi[j][qp]);
-                                KVVe(i, j) += JxW[qp] * dphi[i][qp] * ((sigma_i) * dphi[j][qp]);
-                                KVeV(i, j) += JxW[qp] * dphi[i][qp] * ((sigma_i) * dphi[j][qp]);
-                                KVeVe(i, j) += JxW[qp] * dphi[i][qp] * ((sigma_i + sigma_e) * dphi[j][qp]);
+                                KVV(i, j) += JxW[qp] * dphi[i][qp] * ((sigma_i/factorDiv) * dphi[j][qp]);
+                                KVVe(i, j) += JxW[qp] * dphi[i][qp] * ((sigma_i/factorDiv) * dphi[j][qp]);
+                                KVeV(i, j) += JxW[qp] * dphi[i][qp] * ((sigma_i/factorDiv) * dphi[j][qp]);
+                                KVeVe(i, j) += JxW[qp] * dphi[i][qp] * (((sigma_i + sigma_e)/factorDiv) * dphi[j][qp]);
 
                                 // These are useful for the RHS
                                 MVV(i, j) += JxW[qp] * phi[i][qp] * phi[j][qp];
@@ -1623,8 +2066,35 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
                         }
                     }
                 }
+                else if(subdomain_id == static_cast<short unsigned int>(Subdomain::FIBROSIS))
+				{
+					for (unsigned int qp = 0; qp < qrule.n_points(); qp++)
+					{
+							for (unsigned int i = 0; i != elliptic_ndofs; i++)
+							{
+								for (unsigned int j = 0; j != elliptic_ndofs; j++)
+								{
+									double factorDiv = 1.;
+																	// add mass matrix
+
+
+									// stiffness matrix
+									//KVV(i, j) += JxW[qp] * dphi[i][qp] * ((0.) * dphi[j][qp]);
+									KVVe(i, j) += JxW[qp] * dphi[i][qp] * ((sigma_i + sigma_e) * dphi[j][qp]);
+									//KVeV(i, j) += JxW[qp] * dphi[i][qp] * ((0.) * dphi[j][qp]);
+									//KVeVe(i, j) += JxW[qp] * dphi[i][qp] * (((sigma_i + sigma_e)) * dphi[j][qp]);
+
+									// These are useful for the RHS
+									//MVV(i, j) += JxW[qp] * phi[i][qp] * phi[j][qp];
+									//ML(i) += JxW[qp] * phi[i][qp] * phi[j][qp];
+								}
+							}
+
+					}
+				}
+
                 // boundaries
-                if (subdomain_id == static_cast<libMesh::subdomain_id_type>(Subdomain::BATH))
+                if (subdomain_id == static_cast<libMesh::subdomain_id_type>(Subdomain::BATH) || subdomain_id == static_cast<libMesh::subdomain_id_type>(Subdomain::TORSO))
                 {
                     for (auto side : elem->side_index_range())
                     {
@@ -1649,19 +2119,31 @@ void assemble_matrices(libMesh::EquationSystems &es, const TimeData &timedata, T
                         }
                     }
                 }
+                //libMesh::out << "HERE" << std::endl;
                 system.matrix->add_matrix (K, dof_indices, dof_indices);
                 system.get_matrix("M").add_matrix(M, dof_indices, dof_indices);
                 system.get_vector("ML").add_vector(M_lumped, dof_indices);
                 system.get_vector("I_extra_stim").add_vector(I_extra_stim, dof_indices);
+                if(fibrosisMethod.compare(0,14,"Conductivities") == 0 && fibrosisBool){
+                	libMesh::LinearImplicitSystem &fibrosis_system = es.get_system < libMesh::LinearImplicitSystem > ("Fibrosis");
+                	fibrosis_system.get_vector("Fibrosis_Check").add_vector(Fibrosis_CheckV, parabolic_dof_indices);
+                }
             }
             system.matrix->close();
             system.get_matrix("M").close();
             system.get_vector("ML").close();
             system.get_vector("I_extra_stim").close();
+            if(fibrosisMethod.compare(0,14,"Conductivities") == 0 && fibrosisBool){
+            	libMesh::LinearImplicitSystem &fibrosis_system = es.get_system < libMesh::LinearImplicitSystem > ("Fibrosis");
+            	fibrosis_system.get_vector("Fibrosis_Check").close();
+            }
             break;
         }
+
     }
+    //libMesh::out << "HERE" << std::endl;
 }
+
 
 void assemble_forcing_and_eval_error(libMesh::EquationSystems &es, const TimeData &timedata, TimeIntegrator time_integrator, libMesh::Order p_order, const GetPot &data, IonicModel& ionic_model, std::vector<double>& error )
 {
@@ -1991,6 +2473,7 @@ void assemble_rhs(  libMesh::EquationSystems &es,
     double sigma_s_i = data("sigma_s_i", 0.2435); // sigma_t in the paper
     double sigma_s_e = data("sigma_s_e", 1.0438);  // sigma_t in the paper
     double sigma_b_ie = data("sigma_b", 6.0);
+    double sigma_torso_ie = data("sigma_torso", 6.0);
     bool convergence_test = data("convergence_test", false);
     double xDim = data("maxx", 1.) - data("minx", -1.);
     double v0 = data("v0", 0.);
@@ -2015,10 +2498,10 @@ void assemble_rhs(  libMesh::EquationSystems &es,
             std::vector < dof_id_type > elliptic_dof_indices;
 
             if(convergence_test){
-            	parabolic_system.get_vector("ForcingV").zero();
-            	elliptic_system.get_vector("ForcingVe").zero();
-				ForcingTermConvergence ( es, timedata.dt, chi, Cm, sigma_s_i, sigma_s_e, sigma_b_ie, timedata.time, xDim, v0, v1, v2, kcubic, integrator);
-			}
+                parabolic_system.get_vector("ForcingV").zero();
+                elliptic_system.get_vector("ForcingVe").zero();
+                ForcingTermConvergence ( es, timedata.dt, chi, Cm, sigma_s_i, sigma_s_e, sigma_b_ie, sigma_torso_ie, timedata.time, xDim, v0, v1, v2, kcubic, integrator);
+            }
 
             if(type == EquationType::PARABOLIC)
             {
@@ -2067,7 +2550,7 @@ void assemble_rhs(  libMesh::EquationSystems &es,
                 parabolic_system.rhs->add_vector(parabolic_system.get_vector("aux1"), parabolic_system.get_matrix("M"));
 
                 if(convergence_test){
-                	parabolic_system.rhs->add(parabolic_system.get_vector("ForcingV"));
+                    parabolic_system.rhs->add(parabolic_system.get_vector("ForcingV"));
                 }
 
                 if(time_integrator == TimeIntegrator::SEMI_IMPLICIT ||
@@ -2106,7 +2589,7 @@ void assemble_rhs(  libMesh::EquationSystems &es,
                 }
 
                 if(convergence_test){
-                	elliptic_system.rhs->add(elliptic_system.get_vector("ForcingVe"));
+                    elliptic_system.rhs->add(elliptic_system.get_vector("ForcingVe"));
                 }
 
             }
@@ -2150,7 +2633,7 @@ void assemble_rhs(  libMesh::EquationSystems &es,
             // add forcing
             if(convergence_test){
                 system.get_vector("ForcingConv").zero();
-                ForcingTermConvergence ( es, timedata.dt, chi, Cm, sigma_s_i, sigma_s_e, sigma_b_ie, timedata.time, xDim, v0, v1, v2, kcubic, integrator);
+                ForcingTermConvergence ( es, timedata.dt, chi, Cm, sigma_s_i, sigma_s_e, sigma_b_ie, sigma_torso_ie, timedata.time, xDim, v0, v1, v2, kcubic, integrator);
                 system.rhs->add(system.get_vector("ForcingConv"));
             }
             //system.rhs->add(system.get_vector("F"));
@@ -2195,7 +2678,7 @@ void assemble_rhs(  libMesh::EquationSystems &es,
             // add forcing
             if(convergence_test){
                 system.get_vector("ForcingConv").zero();
-                ForcingTermConvergence ( es, timedata.dt, chi, Cm, sigma_s_i, sigma_s_e, sigma_b_ie, timedata.time, xDim, v0, v1, v2, kcubic, integrator);
+                ForcingTermConvergence ( es, timedata.dt, chi, Cm, sigma_s_i, sigma_s_e, sigma_b_ie, sigma_torso_ie, timedata.time, xDim, v0, v1, v2, kcubic, integrator);
                 system.rhs->add(system.get_vector("ForcingConv"));
             }
             //system.rhs->add(system.get_vector("F"));
@@ -2232,7 +2715,7 @@ void assemble_rhs(  libMesh::EquationSystems &es,
             // add forcing
             if(convergence_test){
                 system.get_vector("ForcingConv").zero();
-                ForcingTermConvergence ( es, timedata.dt, chi, Cm, sigma_s_i, sigma_s_e, sigma_b_ie, timedata.time, xDim, v0, v1, v2, kcubic, integrator);
+                ForcingTermConvergence ( es, timedata.dt, chi, Cm, sigma_s_i, sigma_s_e, sigma_b_ie, sigma_torso_ie, timedata.time, xDim, v0, v1, v2, kcubic, integrator);
                 system.rhs->add(system.get_vector("ForcingConv"));
             }
             //system.rhs->add(system.get_vector("F"));
@@ -2433,7 +2916,6 @@ void exact_solution_monolithic(libMesh::DenseVector<libMesh::Number>& output, co
     output(0) = exact_solution_V(p, time);
     output(1) = exact_solution_Ve_Vb(p, time);
 }
-
 
 
 
@@ -2791,7 +3273,7 @@ void SolverRecovery (EquationSystems & es, const GetPot &data, TimeData& datatim
             }
 
             else if(SpiralBool == 2){
-                if(time < IstimD &&  x < tissue_minx + 0.5 && y > 0. ){
+                if(time < IstimD &&  x < tissue_minx + 0.5 ){
                     Istim = IstimV*1.;//with TIME < 1.2, -.08 is the minimum current stimulus to initiate AP propagation
                     //libMesh::out << Istim << std::endl;
                 }
@@ -2807,7 +3289,6 @@ void SolverRecovery (EquationSystems & es, const GetPot &data, TimeData& datatim
 
                 freact = (-(Ifival + Isival + Isoval)) - Istim  - Istim2;
             }
-
 
 
 
@@ -2944,8 +3425,8 @@ void SolverRecovery (EquationSystems & es, const GetPot &data, TimeData& datatim
                     }
                 }
                 if(convergence_test){
-				  freact = -kcubic*((u_old - u0)*(u_old - u1)*(u_old - u2));// - 1*r_new*(u_old-u0)) - Istim  - Istim2;
-				}
+                  freact = -kcubic*((u_old - u0)*(u_old - u1)*(u_old - u2));// - 1*r_new*(u_old-u0)) - Istim  - Istim2;
+                }
                 else{
                     if(StimPlace.compare(0,13,"Transmembrane") == 0){
                         freact = (-(Ifival + Isival + Isoval)) - Istim  - Istim2;
@@ -2956,6 +3437,7 @@ void SolverRecovery (EquationSystems & es, const GetPot &data, TimeData& datatim
                 }
             }
 
+
             else if(SpiralBool == 1){
                 if(time < IstimD && x < 0. && y > 0.){
                     Istim = IstimV;//with TIME < 1.2, -.08 is the minimum current stimulus to initiate AP propagation
@@ -2965,7 +3447,11 @@ void SolverRecovery (EquationSystems & es, const GetPot &data, TimeData& datatim
             }
 
             else if(SpiralBool == 2){
-                if(time < IstimD &&  x < tissue_minx + 0.5 && y > 0. ){
+                //if(time < IstimD &&  x < tissue_minx + 0.5 ){
+                    //Istim = IstimV*1.;//with TIME < 1.2, -.08 is the minimum current stimulus to initiate AP propagation
+                    //libMesh::out << Istim << std::endl;
+                //}
+                if(time < IstimD &&  y > tissue_maxy - 0.5 ){
                     Istim = IstimV*1.;//with TIME < 1.2, -.08 is the minimum current stimulus to initiate AP propagation
                     //libMesh::out << Istim << std::endl;
                 }
@@ -3002,7 +3488,6 @@ void SolverRecovery (EquationSystems & es, const GetPot &data, TimeData& datatim
   }
 
 
-
 }
 
 
@@ -3015,104 +3500,104 @@ void SolverRecovery (EquationSystems & es, const GetPot &data, TimeData& datatim
 void init_cd_exact (EquationSystems & es, const double xDim, std::string integrator)
 {
 
-	  MeshBase & mesh = es.get_mesh();
-	  const DofMap & dof_map2 = es.get_system("Recovery").get_dof_map();
-	  const unsigned int dim = mesh.mesh_dimension();
-	  QGauss qrule (dim, FIFTH);
-	  double u_h, u_exact, ue_h, ue_exact;
-	  std::vector<dof_id_type> dof_indices;
-	  std::vector<dof_id_type> dof_indices2;
-	  std::vector<dof_id_type> dof_indicesP;
+      MeshBase & mesh = es.get_mesh();
+      const DofMap & dof_map2 = es.get_system("Recovery").get_dof_map();
+      const unsigned int dim = mesh.mesh_dimension();
+      QGauss qrule (dim, FIFTH);
+      double u_h, u_exact, ue_h, ue_exact;
+      std::vector<dof_id_type> dof_indices;
+      std::vector<dof_id_type> dof_indices2;
+      std::vector<dof_id_type> dof_indicesP;
 
 
 
       if(integrator.compare(0,4,"SBDF") == 0){
-    	    TransientLinearImplicitSystem & Bsystem = es.get_system <TransientLinearImplicitSystem> ("bidomain");
-			Bsystem.update();
-			auto femSolu = es.get_system("bidomain").variable_number("V");
-			auto femSolu2 = es.get_system("bidomain").variable_number("Ve");
-			const DofMap & dof_map = es.get_system("bidomain").get_dof_map();
-			FEType fe_type = dof_map.variable_type(femSolu);
-			std::unique_ptr<FEBase> fe (FEBase::build(dim, fe_type));
-			fe->attach_quadrature_rule (&qrule);
-			const std::vector<Point> & q_point = fe->get_xyz();
-			const std::vector<Real> & JxW = fe->get_JxW();
-			const std::vector<std::vector<Real>> & phi = fe->get_phi();
+            TransientLinearImplicitSystem & Bsystem = es.get_system <TransientLinearImplicitSystem> ("bidomain");
+            Bsystem.update();
+            auto femSolu = es.get_system("bidomain").variable_number("V");
+            auto femSolu2 = es.get_system("bidomain").variable_number("Ve");
+            const DofMap & dof_map = es.get_system("bidomain").get_dof_map();
+            FEType fe_type = dof_map.variable_type(femSolu);
+            std::unique_ptr<FEBase> fe (FEBase::build(dim, fe_type));
+            fe->attach_quadrature_rule (&qrule);
+            const std::vector<Point> & q_point = fe->get_xyz();
+            const std::vector<Real> & JxW = fe->get_JxW();
+            const std::vector<std::vector<Real>> & phi = fe->get_phi();
 
-			  for(const auto & node : mesh.local_node_ptr_range()){
+              for(const auto & node : mesh.local_node_ptr_range()){
 
-			  dof_map.dof_indices (node, dof_indices);
-			  dof_map2.dof_indices (node, dof_indices2);
+              dof_map.dof_indices (node, dof_indices);
+              dof_map2.dof_indices (node, dof_indices2);
 
-			  const Real x = (*node)(0);
-			  const Real y = (*node)(1);
+              const Real x = (*node)(0);
+              const Real y = (*node)(1);
 
-			  if(dof_indices2.size() > 0){
+              if(dof_indices2.size() > 0){
 
-				u_exact = exact_solutionV_all(x, y, 2, 0.0, 0.0, xDim);
-				Bsystem.solution -> set(dof_indices[femSolu],u_exact);
-				ue_exact = exact_solutionV_all(x, y, 3, 0.0, 0.0, xDim);
-				Bsystem.solution -> set(dof_indices[femSolu2],ue_exact);
+                u_exact = exact_solutionV_all(x, y, 2, 0.0, 0.0, xDim);
+                Bsystem.solution -> set(dof_indices[femSolu],u_exact);
+                ue_exact = exact_solutionV_all(x, y, 3, 0.0, 0.0, xDim);
+                Bsystem.solution -> set(dof_indices[femSolu2],ue_exact);
 
-			  }
-			  else{
-				ue_exact = exact_solutionV_all(x, y, 4, 0.0, 0.0, xDim);
-				Bsystem.solution -> set(dof_indices[femSolu2],ue_exact);
-			  }
-			}
+              }
+              else{
+                ue_exact = exact_solutionV_all(x, y, 4, 0.0, 0.0, xDim);
+                Bsystem.solution -> set(dof_indices[femSolu2],ue_exact);
+              }
+            }
 
-		  Bsystem.solution -> close();
+          Bsystem.solution -> close();
       }
       else{
 
-    	    libMesh::LinearImplicitSystem &Esystem = es.get_system < libMesh::LinearImplicitSystem > ("elliptic");
-    	    libMesh::TransientLinearImplicitSystem & Psystem = es.get_system < libMesh::TransientLinearImplicitSystem > ("parabolic");
-			Esystem.update();
-			Psystem.update();
-			auto femSolu = es.get_system("parabolic").variable_number("V");
-			auto femSolu2 = es.get_system("elliptic").variable_number("Ve");
-			const DofMap & dof_map = es.get_system("elliptic").get_dof_map();
-			const DofMap & dof_mapP = es.get_system("parabolic").get_dof_map();
-			FEType fe_type = dof_map.variable_type(femSolu2);
-			std::unique_ptr<FEBase> fe (FEBase::build(dim, fe_type));
-			fe->attach_quadrature_rule (&qrule);
-			const std::vector<Point> & q_point = fe->get_xyz();
-			const std::vector<Real> & JxW = fe->get_JxW();
-			const std::vector<std::vector<Real>> & phi = fe->get_phi();
+            libMesh::LinearImplicitSystem &Esystem = es.get_system < libMesh::LinearImplicitSystem > ("elliptic");
+            libMesh::TransientLinearImplicitSystem & Psystem = es.get_system < libMesh::TransientLinearImplicitSystem > ("parabolic");
+            Esystem.update();
+            Psystem.update();
+            auto femSolu = es.get_system("parabolic").variable_number("V");
+            auto femSolu2 = es.get_system("elliptic").variable_number("Ve");
+            const DofMap & dof_map = es.get_system("elliptic").get_dof_map();
+            const DofMap & dof_mapP = es.get_system("parabolic").get_dof_map();
+            FEType fe_type = dof_map.variable_type(femSolu2);
+            std::unique_ptr<FEBase> fe (FEBase::build(dim, fe_type));
+            fe->attach_quadrature_rule (&qrule);
+            const std::vector<Point> & q_point = fe->get_xyz();
+            const std::vector<Real> & JxW = fe->get_JxW();
+            const std::vector<std::vector<Real>> & phi = fe->get_phi();
 
-			  for(const auto & node : mesh.local_node_ptr_range()){
+              for(const auto & node : mesh.local_node_ptr_range()){
 
-			  dof_map.dof_indices (node, dof_indices);
-			  dof_mapP.dof_indices (node, dof_indicesP);
+              dof_map.dof_indices (node, dof_indices);
+              dof_mapP.dof_indices (node, dof_indicesP);
 
-			  const Real x = (*node)(0);
-			  const Real y = (*node)(1);
+              const Real x = (*node)(0);
+              const Real y = (*node)(1);
 
-			  //libMesh::out << "CHECKING FOR ERROR" << std::endl;
+              //libMesh::out << "CHECKING FOR ERROR" << std::endl;
 
-			  if(dof_indicesP.size() == dof_indices.size()){
-				  //libMesh::out << "INSIDE" << std::endl;
-				u_exact = exact_solutionV_all(x, y, 2, 0.0, 0.0, xDim);
-				Psystem.solution -> set(dof_indicesP[femSolu],u_exact);
-				ue_exact = exact_solutionV_all(x, y, 3, 0.0, 0.0, xDim);
-				Esystem.solution -> set(dof_indices[femSolu2],ue_exact);
+              if(dof_indicesP.size() == dof_indices.size()){
+                  //libMesh::out << "INSIDE" << std::endl;
+                u_exact = exact_solutionV_all(x, y, 2, 0.0, 0.0, xDim);
+                Psystem.solution -> set(dof_indicesP[femSolu],u_exact);
+                ue_exact = exact_solutionV_all(x, y, 3, 0.0, 0.0, xDim);
+                Esystem.solution -> set(dof_indices[femSolu2],ue_exact);
 
-			  }
-			  else{
-				ue_exact = exact_solutionV_all(x, y, 4, 0.0, 0.0, xDim);
-				Esystem.solution -> set(dof_indices[femSolu2],ue_exact);
-			  }
-			}
+              }
+              else{
+                ue_exact = exact_solutionV_all(x, y, 4, 0.0, 0.0, xDim);
+                Esystem.solution -> set(dof_indices[femSolu2],ue_exact);
+              }
+            }
 
-		  Psystem.solution -> close();
-		  Esystem.solution -> close();
+          Psystem.solution -> close();
+          Esystem.solution -> close();
       }
 
 
 }
 
 
-void ForcingTermConvergence (libMesh::EquationSystems &es, const double dt, const double Beta, const double Cm, const double SigmaSI, const double SigmaSE, const double SigmaBath, const double CurTime, const double xDim, const double v0, const double v1, const double v2, const double kcubic, const std::string integrator )
+void ForcingTermConvergence (libMesh::EquationSystems &es, const double dt, const double Beta, const double Cm, const double SigmaSI, const double SigmaSE, const double SigmaBath, const double SigmaTorso, const double CurTime, const double xDim, const double v0, const double v1, const double v2, const double kcubic, const std::string integrator )
 {
 
   const MeshBase & mesh = es.get_mesh();
@@ -3129,236 +3614,242 @@ void ForcingTermConvergence (libMesh::EquationSystems &es, const double dt, cons
 
   if(integrator.compare(0,4,"SBDF") == 0){
 
-	  TransientLinearImplicitSystem & Bsystem = es.get_system <TransientLinearImplicitSystem> ("bidomain");
-	  FEType fe_type_V = Bsystem.variable_type(0);
-	  std::unique_ptr<FEBase> fe      (FEBase::build(dim, fe_type_V));
-	  std::unique_ptr<FEBase> fe_face (FEBase::build(dim, fe_type_V));
-	  fe->attach_quadrature_rule      (&qrule);
-	  fe_face->attach_quadrature_rule (&qface);
-	  const std::vector<Real> & JxW      = fe->get_JxW();
-	  const std::vector<Real> & JxW_face = fe_face->get_JxW();
-	  const std::vector<std::vector<Real>> & phi = fe->get_phi();
-	  const std::vector<std::vector<Real>> & psi = fe_face->get_phi();
-	  const std::vector<std::vector<RealGradient>> & dphi = fe->get_dphi();
-	  const std::vector<Point> & q_point = fe->get_xyz();
-	  const std::vector<Point> & qface_points = fe_face->get_xyz();
-	  const DofMap & dof_map = Bsystem.get_dof_map();
+      TransientLinearImplicitSystem & Bsystem = es.get_system <TransientLinearImplicitSystem> ("bidomain");
+      FEType fe_type_V = Bsystem.variable_type(0);
+      std::unique_ptr<FEBase> fe      (FEBase::build(dim, fe_type_V));
+      std::unique_ptr<FEBase> fe_face (FEBase::build(dim, fe_type_V));
+      fe->attach_quadrature_rule      (&qrule);
+      fe_face->attach_quadrature_rule (&qface);
+      const std::vector<Real> & JxW      = fe->get_JxW();
+      const std::vector<Real> & JxW_face = fe_face->get_JxW();
+      const std::vector<std::vector<Real>> & phi = fe->get_phi();
+      const std::vector<std::vector<Real>> & psi = fe_face->get_phi();
+      const std::vector<std::vector<RealGradient>> & dphi = fe->get_dphi();
+      const std::vector<Point> & q_point = fe->get_xyz();
+      const std::vector<Point> & qface_points = fe_face->get_xyz();
+      const DofMap & dof_map = Bsystem.get_dof_map();
 
-	  DenseVector<Number> Fe;
-	  DenseSubVector<Number>
-		FV(Fe),
-		FVe(Fe);
+      DenseVector<Number> Fe;
+      DenseSubVector<Number>
+        FV(Fe),
+        FVe(Fe);
 
-	  for (const auto & elem : mesh.active_local_element_ptr_range())
-		{
-		  dof_map.dof_indices (elem, dof_indices);
-		  dof_map.dof_indices (elem, dof_indices_V, 0);
-		  dof_map.dof_indices (elem, dof_indices_Ve, 1);
+      for (const auto & elem : mesh.active_local_element_ptr_range())
+        {
+          dof_map.dof_indices (elem, dof_indices);
+          dof_map.dof_indices (elem, dof_indices_V, 0);
+          dof_map.dof_indices (elem, dof_indices_Ve, 1);
 
-		  const unsigned int n_dofs   = dof_indices.size();
-		  const unsigned int n_V_dofs = dof_indices_V.size();
-		  const unsigned int n_Ve_dofs = dof_indices_Ve.size();
+          const unsigned int n_dofs   = dof_indices.size();
+          const unsigned int n_V_dofs = dof_indices_V.size();
+          const unsigned int n_Ve_dofs = dof_indices_Ve.size();
 
-		  fe->reinit (elem);
+          fe->reinit (elem);
 
-		  Fe.resize (n_dofs);
+          Fe.resize (n_dofs);
 
-		  FV.reposition (0*n_V_dofs, n_V_dofs);
-		  FVe.reposition (1*n_V_dofs, n_Ve_dofs);
+          FV.reposition (0*n_V_dofs, n_V_dofs);
+          FVe.reposition (1*n_V_dofs, n_Ve_dofs);
 
-			for (unsigned int qp=0; qp<qrule.n_points(); qp++)
-			{
-			  for (unsigned int i=0; i<n_V_dofs; i++){
-				FV(i) += JxW[qp]*((    CalculateF( q_point[qp](0), q_point[qp](1), 0, CurTime, 0.0, dt, Beta, Cm, SigmaSI, SigmaSE, SigmaBath, xDim, v0, v1, v2, kcubic)      )*(phi[i][qp]));
-			  }
-			  for (unsigned int i=0; i<n_Ve_dofs; i++){
-				if(elem->subdomain_id()==1){
-				  FVe(i) += JxW[qp]*((     CalculateF( q_point[qp](0), q_point[qp](1), 1, CurTime, 0.0, dt, Beta, Cm, SigmaSI, SigmaSE, SigmaBath, xDim, v0, v1, v2, kcubic)      )*(phi[i][qp]));
-				}
-				else{
-				  FVe(i) += JxW[qp]*((     CalculateF( q_point[qp](0), q_point[qp](1), 2, CurTime, 0.0, dt, Beta, Cm, SigmaSI, SigmaSE, SigmaBath, xDim, v0, v1, v2, kcubic)     )*(phi[i][qp]));
-				}
-			  }
+            for (unsigned int qp=0; qp<qrule.n_points(); qp++)
+            {
+              for (unsigned int i=0; i<n_V_dofs; i++){
+                FV(i) += JxW[qp]*((    CalculateF( q_point[qp](0), q_point[qp](1), 0, CurTime, 0.0, dt, Beta, Cm, SigmaSI, SigmaSE, SigmaBath, SigmaTorso, xDim, v0, v1, v2, kcubic)      )*(phi[i][qp]));
+              }
+              for (unsigned int i=0; i<n_Ve_dofs; i++){
+                if(elem->subdomain_id()==1){
+                  FVe(i) += JxW[qp]*((     CalculateF( q_point[qp](0), q_point[qp](1), 1, CurTime, 0.0, dt, Beta, Cm, SigmaSI, SigmaSE, SigmaBath, SigmaTorso, xDim, v0, v1, v2, kcubic)      )*(phi[i][qp]));
+                }
+                else if(elem->subdomain_id() == 2){
+                  FVe(i) += JxW[qp]*((     CalculateF( q_point[qp](0), q_point[qp](1), 2, CurTime, 0.0, dt, Beta, Cm, SigmaSI, SigmaSE, SigmaBath, SigmaTorso, xDim, v0, v1, v2, kcubic)     )*(phi[i][qp]));
+                }
+                else if(elem->subdomain_id() == 3){
+                  FVe(i) += JxW[qp]*((     CalculateF( q_point[qp](0), q_point[qp](1), 3, CurTime, 0.0, dt, Beta, Cm, SigmaSI, SigmaSE, SigmaBath, SigmaTorso, xDim, v0, v1, v2, kcubic)     )*(phi[i][qp]));
+                }
+              }
 
-			  }
-			{
-					//BOUNDARIES
-							  for (auto s : elem->side_index_range()){
+              }
+            {
+                    //BOUNDARIES
+                              for (auto s : elem->side_index_range()){
 
-								//libMesh::out << elem << std::endl;
-											if (elem->neighbor_ptr(s) == nullptr)
-											  {
-											  //libMesh::out << "SOMETHING        " << s << std::endl;
+                                //libMesh::out << elem << std::endl;
+                                            if (elem->neighbor_ptr(s) == nullptr)
+                                              {
+                                              //libMesh::out << "SOMETHING        " << s << std::endl;
 
-												std::unique_ptr<const Elem> side (elem->build_side_ptr(s,false));
-												//libMesh::out << side.get() << std::endl;
-												// Loop over the nodes on the side.
-												for (auto ns : side->node_index_range())
-												  {
-													// The location on the boundary of the current
-													// node.
-												  //libMesh::out << ns << std::endl;
+                                                std::unique_ptr<const Elem> side (elem->build_side_ptr(s,false));
+                                                //libMesh::out << side.get() << std::endl;
+                                                // Loop over the nodes on the side.
+                                                for (auto ns : side->node_index_range())
+                                                  {
+                                                    // The location on the boundary of the current
+                                                    // node.
+                                                  //libMesh::out << ns << std::endl;
 
-													const Real xf = side->point(ns)(0);
-													const Real yf = side->point(ns)(1);
+                                                    const Real xf = side->point(ns)(0);
+                                                    const Real yf = side->point(ns)(1);
 
-													// The penalty value.  \f$ \frac{1}{\epsilon \f$
-													const Real penalty = 1.e10;
+                                                    // The penalty value.  \f$ \frac{1}{\epsilon \f$
+                                                    const Real penalty = 1.e10;
 
-													// The boundary values.
+                                                    // The boundary values.
 
-													// Set v = 0 everywhere
-													double Ve_value;
-													Ve_value = exact_solutionV_all( xf, yf, 4, CurTime, 0.0, xDim);
+                                                    // Set v = 0 everywhere
+                                                    double Ve_value;
+                                                    Ve_value = exact_solutionV_all( xf, yf, 4, CurTime, 0.0, xDim);
 
 
-													// Find the node on the element matching this node on
-													// the side.  That defined where in the element matrix
-													// the boundary condition will be applied.
-													//libMesh::out << "  BEFORE CONDITIONS " << std::endl;
+                                                    // Find the node on the element matching this node on
+                                                    // the side.  That defined where in the element matrix
+                                                    // the boundary condition will be applied.
+                                                    //libMesh::out << "  BEFORE CONDITIONS " << std::endl;
 
-													for (auto n : elem->node_index_range()){
-													  if (elem->node_id(n) == side->node_id(ns) && s == 1 || s == 3)
-														{
-														  // Matrix contribution.
-														  //KVeVe(n,n) += penalty;
-														  //Kvv(n,n) += penalty;
+                                                    for (auto n : elem->node_index_range()){
+                                                      if (elem->node_id(n) == side->node_id(ns) && s == 1 || s == 3)
+                                                        {
+                                                          // Matrix contribution.
+                                                          //KVeVe(n,n) += penalty;
+                                                          //Kvv(n,n) += penalty;
 
-														  // Right-hand-side contribution.
-														  FVe(n) += penalty*Ve_value;
-														  //Fv(n) += penalty*v_value;
-														}
-													  }
+                                                          // Right-hand-side contribution.
+                                                          FVe(n) += penalty*Ve_value;
+                                                          //Fv(n) += penalty*v_value;
+                                                        }
+                                                      }
 
-													//libMesh::out << "  AFTER CONDITIONS " << std::endl;
+                                                    //libMesh::out << "  AFTER CONDITIONS " << std::endl;
 
-												  } // end face node loop
-											  }
-							  }// end if (elem->neighbor(side) == nullptr)
+                                                  } // end face node loop
+                                              }
+                              }// end if (elem->neighbor(side) == nullptr)
 
-			 }
+             }
 
-			Bsystem.get_vector("ForcingConv").add_vector    (Fe, dof_indices);
-		}
+            Bsystem.get_vector("ForcingConv").add_vector    (Fe, dof_indices);
+        }
 
-		  Bsystem.get_vector("ForcingConv").close();
+          Bsystem.get_vector("ForcingConv").close();
 
 
   }
 
   else{
 
-  	  LinearImplicitSystem & Esystem = es.get_system <LinearImplicitSystem> ("elliptic");
-  	  TransientLinearImplicitSystem & Psystem = es.get_system <TransientLinearImplicitSystem> ("parabolic");
-  	  FEType fe_type_V = Esystem.variable_type(0);
-  	  std::unique_ptr<FEBase> fe      (FEBase::build(dim, fe_type_V));
-  	  std::unique_ptr<FEBase> fe_face (FEBase::build(dim, fe_type_V));
-  	  fe->attach_quadrature_rule      (&qrule);
-  	  fe_face->attach_quadrature_rule (&qface);
-  	  const std::vector<Real> & JxW      = fe->get_JxW();
-  	  const std::vector<Real> & JxW_face = fe_face->get_JxW();
-  	  const std::vector<std::vector<Real>> & phi = fe->get_phi();
-  	  const std::vector<std::vector<Real>> & psi = fe_face->get_phi();
-  	  const std::vector<std::vector<RealGradient>> & dphi = fe->get_dphi();
-  	  const std::vector<Point> & q_point = fe->get_xyz();
-  	  const std::vector<Point> & qface_points = fe_face->get_xyz();
-  	  const DofMap & dof_mapP = Psystem.get_dof_map();
-  	  const DofMap & dof_mapE = Esystem.get_dof_map();
+      LinearImplicitSystem & Esystem = es.get_system <LinearImplicitSystem> ("elliptic");
+      TransientLinearImplicitSystem & Psystem = es.get_system <TransientLinearImplicitSystem> ("parabolic");
+      FEType fe_type_V = Esystem.variable_type(0);
+      std::unique_ptr<FEBase> fe      (FEBase::build(dim, fe_type_V));
+      std::unique_ptr<FEBase> fe_face (FEBase::build(dim, fe_type_V));
+      fe->attach_quadrature_rule      (&qrule);
+      fe_face->attach_quadrature_rule (&qface);
+      const std::vector<Real> & JxW      = fe->get_JxW();
+      const std::vector<Real> & JxW_face = fe_face->get_JxW();
+      const std::vector<std::vector<Real>> & phi = fe->get_phi();
+      const std::vector<std::vector<Real>> & psi = fe_face->get_phi();
+      const std::vector<std::vector<RealGradient>> & dphi = fe->get_dphi();
+      const std::vector<Point> & q_point = fe->get_xyz();
+      const std::vector<Point> & qface_points = fe_face->get_xyz();
+      const DofMap & dof_mapP = Psystem.get_dof_map();
+      const DofMap & dof_mapE = Esystem.get_dof_map();
 
-  	  DenseVector<Number> FV;
-  	  DenseVector<Number> FVe;
+      DenseVector<Number> FV;
+      DenseVector<Number> FVe;
 
-  	  for (const auto & elem : mesh.active_local_element_ptr_range())
-  		{
-  		  dof_mapP.dof_indices (elem, dof_indices_V);
-  		  dof_mapE.dof_indices (elem, dof_indices_Ve);
+      for (const auto & elem : mesh.active_local_element_ptr_range())
+        {
+          dof_mapP.dof_indices (elem, dof_indices_V);
+          dof_mapE.dof_indices (elem, dof_indices_Ve);
 
-  		  const unsigned int n_V_dofsP = dof_indices_V.size();
-  		  const unsigned int n_Ve_dofsE = dof_indices_Ve.size();
+          const unsigned int n_V_dofsP = dof_indices_V.size();
+          const unsigned int n_Ve_dofsE = dof_indices_Ve.size();
 
-  		  fe->reinit (elem);
+          fe->reinit (elem);
 
-  		  FV.resize (n_V_dofsP);
-  		  FVe.resize (n_Ve_dofsE);
+          FV.resize (n_V_dofsP);
+          FVe.resize (n_Ve_dofsE);
 
-  			for (unsigned int qp=0; qp<qrule.n_points(); qp++)
-  			{
-  			  for (unsigned int i=0; i<n_V_dofsP; i++){
-  				FV(i) += JxW[qp]*((    CalculateF( q_point[qp](0), q_point[qp](1), 0, CurTime, 0.0, dt, Beta, Cm, SigmaSI, SigmaSE, SigmaBath, xDim, v0, v1, v2, kcubic)      )*(phi[i][qp]));
-  			  }
-  			  for (unsigned int i=0; i<n_Ve_dofsE; i++){
-  				if(elem->subdomain_id()==1){
-  				  FVe(i) += JxW[qp]*((     CalculateF( q_point[qp](0), q_point[qp](1), 1, CurTime, 0.0, dt, Beta, Cm, SigmaSI, SigmaSE, SigmaBath, xDim, v0, v1, v2, kcubic)      )*(phi[i][qp]));
-  				}
-  				else{
-  				  FVe(i) += JxW[qp]*((     CalculateF( q_point[qp](0), q_point[qp](1), 2, CurTime, 0.0, dt, Beta, Cm, SigmaSI, SigmaSE, SigmaBath, xDim, v0, v1, v2, kcubic)     )*(phi[i][qp]));
-  				}
-  			  }
+            for (unsigned int qp=0; qp<qrule.n_points(); qp++)
+            {
+              for (unsigned int i=0; i<n_V_dofsP; i++){
+                FV(i) += JxW[qp]*((    CalculateF( q_point[qp](0), q_point[qp](1), 0, CurTime, 0.0, dt, Beta, Cm, SigmaSI, SigmaSE, SigmaBath, SigmaTorso, xDim, v0, v1, v2, kcubic)      )*(phi[i][qp]));
+              }
+              for (unsigned int i=0; i<n_Ve_dofsE; i++){
+                if(elem->subdomain_id()==1){
+                  FVe(i) += JxW[qp]*((     CalculateF( q_point[qp](0), q_point[qp](1), 1, CurTime, 0.0, dt, Beta, Cm, SigmaSI, SigmaSE, SigmaBath, SigmaTorso, xDim, v0, v1, v2, kcubic)      )*(phi[i][qp]));
+                }
+                else if(elem->subdomain_id()==2){
+                  FVe(i) += JxW[qp]*((     CalculateF( q_point[qp](0), q_point[qp](1), 2, CurTime, 0.0, dt, Beta, Cm, SigmaSI, SigmaSE, SigmaBath, SigmaTorso, xDim, v0, v1, v2, kcubic)     )*(phi[i][qp]));
+                }
+                else if(elem->subdomain_id()==3){
+                  FVe(i) += JxW[qp]*((     CalculateF( q_point[qp](0), q_point[qp](1), 3, CurTime, 0.0, dt, Beta, Cm, SigmaSI, SigmaSE, SigmaBath, SigmaTorso, xDim, v0, v1, v2, kcubic)     )*(phi[i][qp]));
+                }
+              }
 
-  			  }
-  			{
-  					//BOUNDARIES
-  							  for (auto s : elem->side_index_range()){
+              }
+            {
+                    //BOUNDARIES
+                              for (auto s : elem->side_index_range()){
 
-  								//libMesh::out << elem << std::endl;
-  											if (elem->neighbor_ptr(s) == nullptr)
-  											  {
-  											  //libMesh::out << "SOMETHING        " << s << std::endl;
+                                //libMesh::out << elem << std::endl;
+                                            if (elem->neighbor_ptr(s) == nullptr)
+                                              {
+                                              //libMesh::out << "SOMETHING        " << s << std::endl;
 
-  												std::unique_ptr<const Elem> side (elem->build_side_ptr(s,false));
-  												//libMesh::out << side.get() << std::endl;
-  												// Loop over the nodes on the side.
-  												for (auto ns : side->node_index_range())
-  												  {
-  													// The location on the boundary of the current
-  													// node.
-  												  //libMesh::out << ns << std::endl;
+                                                std::unique_ptr<const Elem> side (elem->build_side_ptr(s,false));
+                                                //libMesh::out << side.get() << std::endl;
+                                                // Loop over the nodes on the side.
+                                                for (auto ns : side->node_index_range())
+                                                  {
+                                                    // The location on the boundary of the current
+                                                    // node.
+                                                  //libMesh::out << ns << std::endl;
 
-  													const Real xf = side->point(ns)(0);
-  													const Real yf = side->point(ns)(1);
+                                                    const Real xf = side->point(ns)(0);
+                                                    const Real yf = side->point(ns)(1);
 
-  													// The penalty value.  \f$ \frac{1}{\epsilon \f$
-  													const Real penalty = 1.e10;
+                                                    // The penalty value.  \f$ \frac{1}{\epsilon \f$
+                                                    const Real penalty = 1.e10;
 
-  													// The boundary values.
+                                                    // The boundary values.
 
-  													// Set v = 0 everywhere
-  													double Ve_value;
-  													Ve_value = exact_solutionV_all( xf, yf, 4, CurTime, 0.0, xDim);
+                                                    // Set v = 0 everywhere
+                                                    double Ve_value;
+                                                    Ve_value = exact_solutionV_all( xf, yf, 4, CurTime, 0.0, xDim);
 
 
-  													// Find the node on the element matching this node on
-  													// the side.  That defined where in the element matrix
-  													// the boundary condition will be applied.
-  													//libMesh::out << "  BEFORE CONDITIONS " << std::endl;
+                                                    // Find the node on the element matching this node on
+                                                    // the side.  That defined where in the element matrix
+                                                    // the boundary condition will be applied.
+                                                    //libMesh::out << "  BEFORE CONDITIONS " << std::endl;
 
-  													for (auto n : elem->node_index_range()){
-  													  if (elem->node_id(n) == side->node_id(ns) && (s == 1 || s == 3))
-  														{
-  														  // Matrix contribution.
-  														  //KVeVe(n,n) += penalty;
-  														  //Kvv(n,n) += penalty;
+                                                    for (auto n : elem->node_index_range()){
+                                                      if (elem->node_id(n) == side->node_id(ns) && (s == 1 || s == 3))
+                                                        {
+                                                          // Matrix contribution.
+                                                          //KVeVe(n,n) += penalty;
+                                                          //Kvv(n,n) += penalty;
 
-  														  // Right-hand-side contribution.
-  														  FVe(n) += penalty*Ve_value;
-  														  //Fv(n) += penalty*v_value;
-  														}
-  													  }
+                                                          // Right-hand-side contribution.
+                                                          FVe(n) += penalty*Ve_value;
+                                                          //Fv(n) += penalty*v_value;
+                                                        }
+                                                      }
 
-  													//libMesh::out << "  AFTER CONDITIONS " << std::endl;
+                                                    //libMesh::out << "  AFTER CONDITIONS " << std::endl;
 
-  												  } // end face node loop
-  											  }
-  							  }// end if (elem->neighbor(side) == nullptr)
+                                                  } // end face node loop
+                                              }
+                              }// end if (elem->neighbor(side) == nullptr)
 
-  			 }
+             }
 
-  			Psystem.get_vector("ForcingV").add_vector    (FV, dof_indices_V);
-  			Esystem.get_vector("ForcingVe").add_vector    (FVe, dof_indices_Ve);
-  		}
+            Psystem.get_vector("ForcingV").add_vector    (FV, dof_indices_V);
+            Esystem.get_vector("ForcingVe").add_vector    (FVe, dof_indices_Ve);
+        }
 
-  		  Psystem.get_vector("ForcingV").close();
-  		  Esystem.get_vector("ForcingVe").close();
+          Psystem.get_vector("ForcingV").close();
+          Esystem.get_vector("ForcingVe").close();
 
 
     }
